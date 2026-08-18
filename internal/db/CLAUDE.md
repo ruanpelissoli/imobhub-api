@@ -3,9 +3,9 @@
 ## Purpose
 Cria e valida o pool de conexões com o PostgreSQL (`db.go`), aplica as
 migrations SQL no startup (`migrate.go`) e concentra o acesso às tabelas
-`site_selectors` (`selectors_repo.go`) e `listings` (`listings_repo.go`). Os
-structs em `models.go` são o contrato compartilhado com `ai`, `selectors` e
-`scraper` — nenhum outro pacote monta SQL.
+`site_selectors` (`selectors_repo.go`), `listings` (`listings_repo.go`) e
+`properties` (`properties_repo.go`). Os structs em `models.go` são o contrato
+compartilhado com `ai`, `selectors` e `scraper` — nenhum outro pacote monta SQL.
 
 ## Key decisions
 - **`pgxpool` em vez de `database/sql`.** O scraper vai coletar várias fontes em
@@ -46,7 +46,7 @@ structs em `models.go` são o contrato compartilhado com `ai`, `selectors` e
   `migrations`), então o caminho é **relativo ao working directory** do
   processo: uma imagem Docker precisa copiar `migrations/` junto do binário.
 
-## Repositórios (`models.go`, `selectors_repo.go`, `listings_repo.go`)
+## Repositórios (`models.go`, `selectors_repo.go`, `listings_repo.go`, `properties_repo.go`)
 - **`CountListings` usa `COUNT(*)` exato, não a estimativa de
   `pg_class.reltuples`.** O número vai para o resumo do run, que é o indicador
   acompanhado entre execuções: uma estimativa que oscila sem nada ter mudado
@@ -77,7 +77,23 @@ structs em `models.go` são o contrato compartilhado com `ai`, `selectors` e
   `CopyFrom` não serve porque não faz `ON CONFLICT`.
 - `image_urls` e `extra_data` nunca gravam NULL (nil vira `[]`/`{}`): a coleta
   não distingue "sem imagens" de "não sei", e o leitor não deveria ter que
-  distinguir.
+  distinguir. A mesma regra vale para `properties.amenities`/`photos`, e mora
+  num lugar só (`normalizeTextArray`, de quem `normalizeImageURLs` é apelido).
+- **`Property.ID` é `string`, não um tipo UUID.** O valor nasce no banco
+  (`gen_random_uuid()`) e volta pelo `RETURNING`; uma dependência a mais só para
+  transportá-lo não se paga. As queries usam cast explícito (`$1::uuid`), então
+  id malformado vira erro do PostgreSQL — e não uma validação de formato em Go,
+  que rejeitaria formas que o PG aceita (sem hífens, com chaves).
+- **Campos consolidados de `Property` são ponteiros.** A ausência é informação:
+  `nil` é "não consolidado ainda", `0` seria "zero quartos". `COALESCE` no
+  SELECT apagaria a distinção — e `pgx` nem escaneia NULL para `string`/`int`.
+- **`FindPropertiesByCoordinates` filtra em dois passos**: bounding box no SQL
+  (é o que o btree composto `idx_properties_lat_lng` consegue usar) e distância
+  real (haversine) em Go. Só o retângulo devolveria os cantos; só a distância
+  inviabilizaria o índice. A conversão metros→graus é **aproximada** e o
+  retângulo é calculado pela borda mais próxima do polo, com 0,1% de margem:
+  sobrar é de graça, faltar perde imóvel. PostGIS não está na stack — busca
+  geoespacial "de verdade" é outra task.
 
 ## Business logic / invariantes
 - `RunMigrations` é idempotente e roda **antes** do pipeline em `main`.
@@ -94,6 +110,37 @@ structs em `models.go` são o contrato compartilhado com `ai`, `selectors` e
   domínio, com o `runStartedAt` lido **antes** do primeiro upsert. Depois de uma
   coleta interrompida no meio, ela apaga o resto do catálogo; com "agora" no
   lugar do início do run, apaga tudo.
+- **`properties.active_listing_count` é denormalizado, e este pacote é quem o
+  mantém.** `LinkListingToProperty`/`UnlinkListingFromProperty` alteram
+  `listings.property_id` e o contador **na mesma transação** — os dois separados
+  produziriam uma inconsistência que nenhuma leitura posterior detecta. A
+  transação começa com `SELECT ... FROM listings ... FOR UPDATE`: sem esse lock,
+  dois links concorrentes do mesmo anúncio leriam ambos `property_id` NULL e
+  contariam duas vezes. A aritmética (`count + 1`, `GREATEST(count - 1, 0)`)
+  acontece dentro do `UPDATE`, nunca em Go.
+- **Ambas as operações são idempotentes.** Religar o anúncio ao mesmo imóvel não
+  incrementa de novo (a comparação é feita pelo PostgreSQL, tipo `uuid`, para
+  não errar em UUID maiúsculo/sem hífens); religar a **outro** imóvel decrementa
+  o antigo e incrementa o novo na mesma transação; desvincular um anúncio já
+  solto é no-op — é isso que impede o contador de ficar negativo.
+- **`DeleteProperty` tem a guarda no próprio `DELETE`**
+  (`WHERE id = $1 AND active_listing_count = 0`), não num `SELECT` anterior: um
+  read-then-delete deixaria um vínculo criado no meio virar anúncio órfão
+  (a FK é `ON DELETE SET NULL`). Quando nada é apagado, uma segunda query
+  distingue `ErrPropertyNotFound` de `ErrPropertyHasListings` — aí já não há
+  corrida a perder, o resultado é só a mensagem.
+- `ErrPropertyNotFound`, `ErrPropertyHasListings` e `ErrListingNotFound` são
+  comparáveis com `errors.Is`: quem corrige uma deduplicação errada reage a
+  `ErrPropertyHasListings` desvinculando os anúncios, sem inspecionar texto.
+- **`GetPropertyByID` devolve `(nil, nil)` para id inexistente** (mesmo contrato
+  de `GetSelectorsByDomain`: um imóvel pode ter sido apagado). `UpdateProperty`,
+  ao contrário, trata ausência como erro — ali significa atualização perdida em
+  silêncio.
+- **`CreateProperty`/`UpdateProperty` ignoram `ActiveListingCount`** (e o Update
+  não toca em `created_at`): deixar o caller gravar o contador dessincronizaria
+  a contagem sem aviso. Hoje toda linha em `listings` é "ativa" (as sumidas são
+  apagadas por `DeleteStaleListings`), então incrementar no vínculo é correto —
+  **se `listings` ganhar coluna de status, esta regra precisa ser revista.**
 - `(source_domain, listing_url)` e `domain` são as identidades usadas nos
   `ON CONFLICT`; ambos precisam chegar já **normalizados** (host sem esquema e
   sem barra final). Este pacote só faz `TrimSpace` — normalizar host é
@@ -109,9 +156,11 @@ structs em `models.go` são o contrato compartilhado com `ai`, `selectors` e
   como query params (`pool_max_conns`).
 
 - Os testes deste pacote **não tocam no banco**: cobrem só as funções puras
-  (montagem de argumentos, validação, JSON). O comportamento do SQL — upsert,
-  `ON CONFLICT`, contagem do DELETE — depende de um PostgreSQL real e fica para
-  o QA / testes de integração.
+  (montagem de argumentos, validação, JSON, bounding box/haversine). O
+  comportamento do SQL — upsert, `ON CONFLICT`, contagem do DELETE,
+  idempotência do vínculo, `GREATEST` no contador, guarda do
+  `DeleteProperty` — depende de um PostgreSQL real e fica para o QA / testes de
+  integração. Não há testcontainers nem banco in-memory aqui, de propósito.
 - `MarkSelectorsBroken` com domínio inexistente **não** é erro; apenas loga um
   warning. Na prática esse warning significa host não normalizado no chamador.
 
@@ -120,5 +169,7 @@ structs em `models.go` são o contrato compartilhado com `ai`, `selectors` e
 `selectors`, `ai` e `scraper` consomem `SelectorConfig`/`RawListing` daqui. Os
 arquivos de schema ficam em `migrations/` na raiz — ver o CLAUDE.md de lá para
 as regras das tabelas `site_selectors`, `listings` (incluindo as colunas de
-enriquecimento) e `properties`. `properties` ainda **não** tem struct em
-`models.go` nem repositório aqui: por enquanto existe só no schema.
+enriquecimento) e `properties`. A regra de deduplicação (que combinação de
+endereço/geo/atributos identifica o mesmo imóvel) **não** vive aqui: este pacote
+só oferece o vínculo `listing → property`; quem decide o vínculo é o pipeline de
+enriquecimento.

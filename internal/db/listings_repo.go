@@ -212,12 +212,10 @@ func listingArgs(listing RawListing) ([]any, error) {
 
 // normalizeImageURLs troca nil por slice vazia. A coluna aceita NULL, mas
 // gravar NULL obrigaria todo leitor a distinguir "sem imagens" de "não sei" —
-// distinção que a coleta não faz.
+// distinção que a coleta não faz. A regra é a mesma de amenities/photos em
+// properties, então mora num lugar só (ver normalizeTextArray).
 func normalizeImageURLs(urls []string) []string {
-	if urls == nil {
-		return []string{}
-	}
-	return urls
+	return normalizeTextArray(urls)
 }
 
 // encodeExtraData serializa extra_data. nil vira objeto vazio pelo mesmo motivo
