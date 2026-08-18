@@ -21,6 +21,12 @@ regra de negócio mora aqui — ela vive em `internal/`.
   ordenado em vez de kill abrupto. SIGTERM é o sinal que orquestradores de
   container enviam.
 
+- **O `ratelimit.DomainLimiter` é criado aqui, uma vez só.** O espaçamento por
+  domínio só existe se todas as requisições passarem pelo mesmo limiter: dois
+  limiters teriam relógios independentes e dobrariam a carga na fonte. Por isso
+  ele nasce em `run` e será injetado no pipeline, em vez de ser construído dentro
+  de cada componente.
+
 ## Business logic / invariantes
 - Ordem de inicialização é obrigatória: **config → db → migrations → coleta**. A
   config valida as variáveis obrigatórias, o `db.Connect` valida a conectividade
@@ -43,5 +49,5 @@ regra de negócio mora aqui — ela vive em `internal/`.
   nova esperando que ele reverta: não há `down`.
 
 ## Dependencies
-`internal/config`, `internal/db`. Deve permanecer fino — se lógica começar a se
+`internal/config`, `internal/db`, `internal/ratelimit`. Deve permanecer fino — se lógica começar a se
 acumular aqui, mova para um pacote em `internal/`.

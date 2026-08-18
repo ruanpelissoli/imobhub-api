@@ -60,7 +60,7 @@ Duas camadas:
 - O path avaliado inclui a query string (regras como `Disallow: /busca?*`).
 - A busca do robots.txt **não passa pelo `ratelimit`**: é uma requisição por
   host, feita antes de tudo. Se isso mudar, cuidado com deadlock de ordem entre
-  `Limiter.Wait` e o fetch.
+  `DomainLimiter.Wait` e o fetch.
 
 ## Dependencies
 `github.com/temoto/robotstxt`, `net/http`, `log/slog`. Consumido por
