@@ -1,0 +1,11 @@
+# Mantém o contexto de build pequeno e evita copiar segredos para a imagem.
+.git
+.gitignore
+.env
+*.md
+docker-compose.yml
+Dockerfile
+.dockerignore
+*.test
+coverage.*
+*.out
