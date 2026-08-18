@@ -1,9 +1,11 @@
 # internal/db
 
 ## Purpose
-Cria e valida o pool de conexões com o PostgreSQL (`db.go`) e aplica as
-migrations SQL no startup (`migrate.go`). Os demais pacotes recebem o
-`*pgxpool.Pool` já pronto e executam suas queries a partir dele.
+Cria e valida o pool de conexões com o PostgreSQL (`db.go`), aplica as
+migrations SQL no startup (`migrate.go`) e concentra o acesso às tabelas
+`site_selectors` (`selectors_repo.go`) e `listings` (`listings_repo.go`). Os
+structs em `models.go` são o contrato compartilhado com `ai`, `selectors` e
+`scraper` — nenhum outro pacote monta SQL.
 
 ## Key decisions
 - **`pgxpool` em vez de `database/sql`.** O scraper vai coletar várias fontes em
@@ -44,6 +46,34 @@ migrations SQL no startup (`migrate.go`). Os demais pacotes recebem o
   `migrations`), então o caminho é **relativo ao working directory** do
   processo: uma imagem Docker precisa copiar `migrations/` junto do binário.
 
+## Repositórios (`models.go`, `selectors_repo.go`, `listings_repo.go`)
+- **Funções livres recebendo `*pgxpool.Pool`**, sem struct `Repository` nem
+  interface. Não há o que injetar: um pacote, um banco, nenhum estado por
+  repositório. A interface pode nascer no consumidor no dia em que houver dois
+  backends — criá-la agora seria abstração sem segundo caso.
+- **JSONB decodificado em Go** (`decodeSelectors`) e não via `pgtype`: um JSON
+  malformado vira um erro citando o domínio, em vez de um erro de scan opaco.
+  Chaves desconhecidas são ignoradas de propósito — a IA pode devolver campos
+  extras e derrubar a coleta por isso seria pior.
+- **As tags `json` de `SelectorFields` são o formato gravado no banco.**
+  Renomear qualquer uma invalida todas as linhas já persistidas (o teste de
+  round trip existe para lembrar disso).
+- **`UpsertSelectors` grava sempre `status='valid'` + `last_validated_at=NOW()`**
+  e ignora `config.Status`: ela registra um sucesso de validação, não é uma
+  gravação neutra. O caminho de falha é `MarkSelectorsBroken`, que preserva
+  `last_validated_at` (continua sendo "a última vez que funcionou").
+- **`render_mode` é normalizado antes do INSERT** (`normalizeRenderMode`); sem
+  isso o valor errado só falharia na CHECK constraint, com uma mensagem que não
+  diz qual valor foi enviado. Vazio vira `static`.
+- **`UpsertListings` roda numa transação única, em lotes de
+  `upsertBatchSize` via `pgx.Batch`.** A transação não é preciosismo: um upsert
+  parcial deixaria anúncios vivos com `last_seen_at` antigo e
+  `DeleteStaleListings` os apagaria. O lote existe só para diluir round-trips;
+  `CopyFrom` não serve porque não faz `ON CONFLICT`.
+- `image_urls` e `extra_data` nunca gravam NULL (nil vira `[]`/`{}`): a coleta
+  não distingue "sem imagens" de "não sei", e o leitor não deveria ter que
+  distinguir.
+
 ## Business logic / invariantes
 - `RunMigrations` é idempotente e roda **antes** do pipeline em `main`.
 - `Connect` fecha o pool antes de retornar erro. Consequência para o chamador:
@@ -52,6 +82,17 @@ migrations SQL no startup (`migrate.go`). Os demais pacotes recebem o
 - O `ctx` passado governa o ciclo de vida do pool (cancelá-lo encerra conexões
   ociosas), **não** apenas a criação. Em `main` passamos o contexto de sinais,
   para que SIGTERM encerre as conexões ordenadamente.
+- **Domínio sem seletores não é erro:** `GetSelectorsByDomain` devolve
+  `(nil, nil)`. É o caso normal de uma fonte nova, e o chamador reage acionando
+  a descoberta pela IA. Confundir isso com erro trava a primeira coleta.
+- **`DeleteStaleListings` só pode rodar depois de uma coleta bem-sucedida** do
+  domínio, com o `runStartedAt` lido **antes** do primeiro upsert. Depois de uma
+  coleta interrompida no meio, ela apaga o resto do catálogo; com "agora" no
+  lugar do início do run, apaga tudo.
+- `(source_domain, listing_url)` e `domain` são as identidades usadas nos
+  `ON CONFLICT`; ambos precisam chegar já **normalizados** (host sem esquema e
+  sem barra final). Este pacote só faz `TrimSpace` — normalizar host é
+  responsabilidade de quem coleta.
 
 ## Gotchas
 - **Nunca inclua a `DATABASE_URL` numa mensagem de erro** — ela contém a senha e
@@ -62,8 +103,15 @@ migrations SQL no startup (`migrate.go`). Os demais pacotes recebem o
   `cfg` antes do `NewWithConfig` — a `DATABASE_URL` também aceita alguns deles
   como query params (`pool_max_conns`).
 
+- Os testes deste pacote **não tocam no banco**: cobrem só as funções puras
+  (montagem de argumentos, validação, JSON). O comportamento do SQL — upsert,
+  `ON CONFLICT`, contagem do DELETE — depende de um PostgreSQL real e fica para
+  o QA / testes de integração.
+- `MarkSelectorsBroken` com domínio inexistente **não** é erro; apenas loga um
+  warning. Na prática esse warning significa host não normalizado no chamador.
+
 ## Dependencies
-`github.com/jackc/pgx/v5` e `pgxpool`. Importado por `cmd/scraper`; será
-importado pelos pacotes de persistência conforme forem criados. Os arquivos de
-schema ficam em `migrations/` na raiz — ver o CLAUDE.md de lá para as regras das
-tabelas `site_selectors` e `listings`.
+`github.com/jackc/pgx/v5` e `pgxpool`. Importado por `cmd/scraper`; os pacotes
+`selectors`, `ai` e `scraper` consomem `SelectorConfig`/`RawListing` daqui. Os
+arquivos de schema ficam em `migrations/` na raiz — ver o CLAUDE.md de lá para
+as regras das tabelas `site_selectors` e `listings`.
