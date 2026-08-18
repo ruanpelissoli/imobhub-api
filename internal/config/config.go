@@ -15,14 +15,16 @@ import (
 // Defaults aplicados quando a variável de ambiente correspondente não está
 // definida ou está vazia.
 const (
-	DefaultSourcesFile  = "sources.txt"
-	DefaultUserAgent    = "ImobHubBot/1.0"
-	DefaultRateLimitMS  = 2000
-	envDatabaseURL      = "DATABASE_URL"
-	envAnthropicAPIKey  = "ANTHROPIC_API_KEY"
-	envSourcesFile      = "SOURCES_FILE"
-	envScraperUserAgent = "SCRAPER_USER_AGENT"
-	envScraperRateLimit = "SCRAPER_RATE_LIMIT_MS"
+	DefaultSourcesFile   = "sources.txt"
+	DefaultUserAgent     = "ImobHubBot/1.0"
+	DefaultRateLimitMS   = 2000
+	DefaultMigrationsDir = "migrations"
+	envDatabaseURL       = "DATABASE_URL"
+	envAnthropicAPIKey   = "ANTHROPIC_API_KEY"
+	envSourcesFile       = "SOURCES_FILE"
+	envScraperUserAgent  = "SCRAPER_USER_AGENT"
+	envScraperRateLimit  = "SCRAPER_RATE_LIMIT_MS"
+	envMigrationsDir     = "MIGRATIONS_DIR"
 )
 
 // Config agrupa toda a configuração de runtime do scraper.
@@ -39,6 +41,9 @@ type Config struct {
 	ScraperUserAgent string
 	// ScraperRateLimit é o intervalo mínimo entre requisições para o mesmo host.
 	ScraperRateLimit time.Duration
+	// MigrationsDir é o diretório com os arquivos .sql de migration aplicados
+	// no startup. Relativo ao working directory do processo.
+	MigrationsDir string
 }
 
 // ErrMissingRequired indica que uma ou mais variáveis obrigatórias não foram
@@ -83,6 +88,7 @@ func Load() (*Config, error) {
 		SourcesFile:      lookup(envSourcesFile, DefaultSourcesFile),
 		ScraperUserAgent: lookup(envScraperUserAgent, DefaultUserAgent),
 		ScraperRateLimit: time.Duration(rateLimitMS) * time.Millisecond,
+		MigrationsDir:    lookup(envMigrationsDir, DefaultMigrationsDir),
 	}, nil
 }
 

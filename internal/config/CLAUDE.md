@@ -9,7 +9,8 @@ ambiente diretamente.
 - **Obrigatórias:** `DATABASE_URL`, `ANTHROPIC_API_KEY`. Sem elas o processo não
   sobe.
 - **Opcionais com default:** `SOURCES_FILE` (`sources.txt`),
-  `SCRAPER_USER_AGENT` (`ImobHubBot/1.0`), `SCRAPER_RATE_LIMIT_MS` (`2000`).
+  `SCRAPER_USER_AGENT` (`ImobHubBot/1.0`), `SCRAPER_RATE_LIMIT_MS` (`2000`),
+  `MIGRATIONS_DIR` (`migrations`).
 - `SCRAPER_RATE_LIMIT_MS` é convertido para `time.Duration` aqui, não nos
   chamadores: quem consome a config recebe uma duração já tipada e não precisa
   saber que a unidade original era milissegundo. `0` é aceito e desativa o rate
@@ -38,5 +39,7 @@ Importado por `cmd/scraper`.
   struct `Config` e o `.env.example` na raiz. O `.env.example` é a documentação
   de fato para quem sobe o projeto.
 - `Config` não é validada além do parsing (ex.: não checamos se a
-  `DATABASE_URL` é alcançável). Essa validação é do `internal/db`, que faz
-  `Ping` na conexão.
+  `DATABASE_URL` é alcançável nem se `MIGRATIONS_DIR` existe). Essa validação é
+  do `internal/db`, que faz `Ping` na conexão e lê o diretório de migrations.
+- Caminhos (`SOURCES_FILE`, `MIGRATIONS_DIR`) são usados como vieram: relativos
+  ao **working directory do processo**, não à raiz do repositório.

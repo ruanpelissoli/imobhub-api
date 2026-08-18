@@ -43,6 +43,12 @@ func run() error {
 	}
 	defer pool.Close()
 
+	// As migrations rodam antes de qualquer coleta: o pipeline pressupõe que as
+	// tabelas site_selectors e listings existem no formato desta versão.
+	if err := db.RunMigrations(ctx, pool, cfg.MigrationsDir); err != nil {
+		return err
+	}
+
 	slog.Info("imobhub scraper started",
 		"sources_file", cfg.SourcesFile,
 		"user_agent", cfg.ScraperUserAgent,

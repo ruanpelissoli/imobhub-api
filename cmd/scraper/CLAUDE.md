@@ -22,16 +22,25 @@ regra de negócio mora aqui — ela vive em `internal/`.
   container enviam.
 
 ## Business logic / invariantes
-- Ordem de inicialização é obrigatória: **config → db → coleta**. A config
-  valida as variáveis obrigatórias e o `db.Connect` valida a conectividade com
-  um `Ping`; ambos falham no boot em vez de na primeira query.
+- Ordem de inicialização é obrigatória: **config → db → migrations → coleta**. A
+  config valida as variáveis obrigatórias, o `db.Connect` valida a conectividade
+  com um `Ping` e o `db.RunMigrations` garante que o schema esperado existe;
+  todos falham no boot em vez de na primeira query.
+- `db.RunMigrations` recebe `cfg.MigrationsDir` (`MIGRATIONS_DIR`, default
+  `migrations`), resolvido a partir do **working directory** do processo — rode
+  o binário da raiz do repositório, ou copie `migrations/` ao lado dele na
+  imagem.
 - `defer pool.Close()` só é registrado quando `db.Connect` retorna `err == nil`
   — o contrato de `Connect` é fechar o pool sozinho em caso de erro.
 
 ## Gotchas
-- Este binário ainda não faz coleta: ele sobe, valida config e conexão, loga e
-  encerra com sucesso. É o suficiente para `go build ./...` e para um healthcheck
-  de deploy, mas não confunda "processo saiu com 0" com "coletou alguma coisa".
+- Este binário ainda não faz coleta: ele sobe, valida config e conexão, aplica
+  as migrations, loga e encerra com sucesso. É o suficiente para
+  `go build ./...` e para um healthcheck de deploy, mas não confunda "processo
+  saiu com 0" com "coletou alguma coisa".
+- Como cada execução aplica migrations, subir o binário **altera o schema**. Não
+  aponte um processo de versão antiga para um banco já migrado por uma versão
+  nova esperando que ele reverta: não há `down`.
 
 ## Dependencies
 `internal/config`, `internal/db`. Deve permanecer fino — se lógica começar a se
