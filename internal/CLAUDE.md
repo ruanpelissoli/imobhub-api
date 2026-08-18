@@ -27,6 +27,7 @@ Grafo de importação atual (mantê-lo acíclico e raso):
 cmd/scraper → config, db, ratelimit
 scraper     → httpclient, robots, ratelimit, selectors, sources   (futuro)
 selectors   → ai                                                  (futuro)
+ai          → db          (SelectorFields e as constantes de render mode)
 robots      → net/http (client próprio, timeout de 10s para o robots.txt)
 ```
 

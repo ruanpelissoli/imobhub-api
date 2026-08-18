@@ -27,12 +27,21 @@ type Client struct {
 // (em vez de deixar o SDK ler ANTHROPIC_API_KEY do ambiente) para que toda a
 // configuração passe pelo pacote config.
 func New(apiKey string) (*Client, error) {
+	return newClient(apiKey)
+}
+
+// newClient é a construção real. As opções extras existem para os testes do
+// pacote, que apontam o SDK para um httptest.Server; elas não são expostas
+// porque nenhum pacote de negócio deve importar tipos do SDK.
+func newClient(apiKey string, opts ...option.RequestOption) (*Client, error) {
 	if apiKey == "" {
 		return nil, ErrMissingAPIKey
 	}
 
+	opts = append([]option.RequestOption{option.WithAPIKey(apiKey)}, opts...)
+
 	return &Client{
-		api:   anthropic.NewClient(option.WithAPIKey(apiKey)),
+		api:   anthropic.NewClient(opts...),
 		model: DefaultModel,
 	}, nil
 }
