@@ -1,0 +1,14 @@
+# Lista de fontes (imobiliárias) a serem raspadas.
+# Caminho configurável pela variável de ambiente SOURCES_FILE (default: sources.txt).
+#
+# Formato:
+#   - uma URL por linha, absoluta, com scheme http ou https
+#   - linhas em branco são ignoradas
+#   - linhas iniciadas por "#" são comentários (só no início da linha)
+#   - URLs repetidas são descartadas, mantendo a primeira ocorrência
+#   - linhas inválidas são ignoradas com um aviso no log, sem interromper a coleta
+#
+# Exemplos (fictícios — descomente e substitua pelas fontes reais):
+# https://www.imobiliariaexemplo.com.br/imoveis/venda
+# https://www.larideal-imoveis.com.br/busca?tipo=apartamento
+# https://imoveis.casanovacorretora.com.br/alugueis
