@@ -88,3 +88,62 @@ type RawListing struct {
 	// acima. nil é gravado como objeto vazio, nunca como NULL.
 	ExtraData map[string]any
 }
+
+// Property é o registro canônico de um imóvel: a versão consolidada e já
+// normalizada do que vários anúncios (RawListing) dizem sobre o mesmo imóvel
+// físico. A relação é 1:N — cada linha de listings aponta para no máximo uma
+// property, via listings.property_id.
+//
+// Os campos consolidados são **ponteiros** porque a coluna é nullable e a
+// ausência é informação: nil significa "ainda não consolidado/não informado",
+// enquanto 0 significaria "zero quartos" e "" significaria "endereço vazio".
+// Trocar por valores não-ponteiro apagaria essa distinção — e pgx nem escaneia
+// NULL para string/int.
+//
+// Não há chave de deduplicação aqui (nenhum UNIQUE além da PK): qual combinação
+// de endereço/geo/atributos identifica o mesmo imóvel é decisão da task de
+// deduplicação.
+type Property struct {
+	// ID é o UUID gerado pelo PostgreSQL (gen_random_uuid()). Fica vazio até o
+	// CreateProperty retornar; é string (e não um tipo UUID) para não trazer
+	// dependência nova — o cast para uuid é feito no SQL.
+	ID string
+	// CanonicalAddress é o endereço consolidado a partir dos address_raw dos
+	// anúncios. TEXT livre: os portais brasileiros variam demais.
+	CanonicalAddress *string
+	Neighborhood     *string
+	City             *string
+	State            *string
+	// Lat e Lng são o resultado da geocodificação. nil enquanto o imóvel não
+	// foi geocodificado — nem todo endereço bruto é resolvível. Propriedades
+	// com nil aqui são ignoradas por FindPropertiesByCoordinates.
+	Lat *float64
+	Lng *float64
+	// Atributos físicos consolidados.
+	BedroomCount  *int
+	BathroomCount *int
+	ParkingSpots  *int
+	// AreaSqm é a área em m². float porque os portais publicam valores
+	// fracionários (72,5 m²).
+	AreaSqm *float64
+	// Amenities vai para a coluna amenities (TEXT[]). nil é gravado como array
+	// vazio, nunca como NULL — mesma regra de RawListing.ImageURLs. Na leitura,
+	// NULL e vazio são tratados igual.
+	Amenities   []string
+	Description *string
+	// Photos segue a mesma regra de Amenities.
+	Photos []string
+	// TransactionType ("venda"/"aluguel") e PropertyType ("apartamento"/...)
+	// são TEXT livre de propósito: o vocabulário ainda não foi fechado e este
+	// pacote **não** valida os valores.
+	TransactionType *string
+	PropertyType    *string
+	// ActiveListingCount é o contador denormalizado de anúncios apontando para
+	// este imóvel. É preenchido na leitura e **ignorado** na escrita: quem o
+	// mantém são LinkListingToProperty/UnlinkListingFromProperty, dentro da
+	// mesma transação que altera listings.property_id. Deixar o caller gravá-lo
+	// permitiria dessincronizar o contador com um Update descuidado.
+	ActiveListingCount int
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+}
