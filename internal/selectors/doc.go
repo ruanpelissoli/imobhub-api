@@ -1,6 +1,8 @@
-// Package selectors guarda os seletores CSS por fonte usados na extração dos
-// dados dos imóveis, incluindo a descoberta assistida por IA (pacote ai) quando
-// uma fonte nova não tem seletores conhecidos.
+// Package selectors decide, para cada domínio, quais seletores CSS usar na
+// extração dos anúncios: reaproveita os que já estão em site_selectors enquanto
+// forem válidos e aciona a descoberta assistida por IA (pacote ai) quando a
+// fonte é nova ou os seletores pararam de funcionar.
 //
-// Ainda não implementado: este task cria apenas o scaffolding do projeto.
+// A porta de entrada é SelectorService: EnsureSelectors no caminho normal da
+// coleta e RecoverSelectors quando o extrator não encontra mais nenhum anúncio.
 package selectors
