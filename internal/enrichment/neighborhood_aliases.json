@@ -1,0 +1,29 @@
+{
+  "global": {
+    "centro": "Centro",
+    "jd. botanico": "Jardim Botânico",
+    "jardim botanico": "Jardim Botânico",
+    "sudoeste": "Sudoeste"
+  },
+  "cities": {
+    "brasilia": {
+      "asa nte": "Asa Norte",
+      "asa norte": "Asa Norte",
+      "asa sul": "Asa Sul",
+      "lago norte": "Lago Norte",
+      "lago sul": "Lago Sul",
+      "sudoeste": "Setor Sudoeste",
+      "noroeste": "Setor Noroeste",
+      "aguas claras": "Águas Claras",
+      "guara": "Guará",
+      "taguatinga": "Taguatinga"
+    },
+    "goiania": {
+      "st. bueno": "Setor Bueno",
+      "setor bueno": "Setor Bueno",
+      "st. oeste": "Setor Oeste",
+      "jd. goias": "Jardim Goiás",
+      "st. marista": "Setor Marista"
+    }
+  }
+}

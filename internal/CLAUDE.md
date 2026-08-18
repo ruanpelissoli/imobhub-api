@@ -29,7 +29,7 @@ scraper     → config, db, ratelimit, robots, selectors, sources, pgxpool
 selectors   → ai, db, httpclient
 ai          → db          (SelectorFields e as constantes de render mode)
 robots      → net/http (client próprio, timeout de 10s para o robots.txt)
-enrichment  → stdlib + x/text (dobramento de acento) + yaml/v4 (vocabulário)
+enrichment  → stdlib + x/text (normalização e fold) + yaml/v4 (vocabulário de comodidades)
 ```
 
 `scraper` chega a `httpclient` **através** de `selectors.StaticFetcher`/
@@ -42,8 +42,9 @@ grafo prevê o sentido contrário. O User-Agent chega como string (de `config` o
 de `httpclient.Client.UserAgent()`).
 
 `config` não importa nada do projeto — é a folha do grafo. `enrichment` também:
-recebe o caminho do vocabulário de comodidades por parâmetro (de
-`config.AmenitiesFile`) e não importa nem `config` nem `db`.
+sem banco, sem rede, sem IA. O vocabulário de comodidades chega por parâmetro de
+construtor (de `config.AmenitiesFile`); a tabela de aliases de bairros é embutida
+via `//go:embed`, sem variável de ambiente extra nem `COPY` no Dockerfile.
 
 ## Gotchas
 - `selectors/` já está implementado (`SelectorService`: reuso da linha
@@ -59,12 +60,14 @@ recebe o caminho do vocabulário de comodidades por parâmetro (de
   `httpclient.FetchHeadless` — busca de página (estática ou headless) é
   responsabilidade de `httpclient`. `sources/` já está implementado (`ReadSources`) — o `doc.go`
   dele deu lugar a `reader.go`, que carrega o doc do pacote.
-- **`enrichment/` ainda não tem chamador.** `TermExtractor` (quartos +
-  comodidades a partir do texto livre) está pronto e testado, mas nada em
-  `cmd/scraper` o constrói: o wiring entra junto com a fila de enriquecimento
-  (`listings.enriched_at IS NULL`). Quem for ligá-lo carrega o vocabulário
-  **uma vez** com `enrichment.NewTermExtractor(cfg.AmenitiesFile)` e injeta o
-  extrator — não chame o loader por anúncio.
+- **`enrichment/` ainda não tem chamador.** O pacote entrega `TermExtractor`
+  (quartos + comodidades a partir do texto livre) e `NeighborhoodNormalizer`
+  (bairro canônico), ambos prontos e testados, mas nada em `cmd/scraper` os
+  constrói. O wiring entra junto com a fila de enriquecimento
+  (`listings.enriched_at IS NULL`); não duplicar esse plumbing por enricher.
+  Quem ligar o `TermExtractor` carrega o vocabulário **uma vez** com
+  `enrichment.NewTermExtractor(cfg.AmenitiesFile)` e injeta o extrator — não
+  chame o loader por anúncio.
 - Logs operacionais usam `log/slog` (handler JSON configurado em `main`). Não
   usar `fmt.Println`/`log.Printf`: quebra o parsing dos logs em produção.
 - Erros são embrulhados com `fmt.Errorf("pacote: ... %w", err)` e sempre citam o
