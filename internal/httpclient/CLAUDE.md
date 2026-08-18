@@ -99,5 +99,7 @@ Duas portas de entrada, com contratos diferentes:
 ## Dependencies
 `github.com/PuerkitoBio/goquery`, `github.com/chromedp/chromedp` (+ `cdproto` para
 os eventos de ciclo de vida), `golang.org/x/net/html/charset` (que puxa
-`golang.org/x/text` para as tabelas de encoding), stdlib `net/http`. Será
-importado por `internal/scraper`.
+`golang.org/x/text` para as tabelas de encoding), stdlib `net/http`. Importado
+por `internal/selectors` (que embrulha `FetchStatic`/`FetchHeadless` nos
+adaptadores `StaticFetcher`/`HeadlessFetcher`) e, futuramente, por
+`internal/scraper`.
