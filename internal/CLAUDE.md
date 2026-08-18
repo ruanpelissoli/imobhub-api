@@ -33,9 +33,10 @@ robots      ← httpclient (apenas o User-Agent, via string)
 `config` não importa nada do projeto — é a folha do grafo.
 
 ## Gotchas
-- `sources/` e `selectors/` contêm apenas `doc.go`. São placeholders desta task
-  de scaffolding; o Go exige um arquivo `.go` para que o diretório seja um
-  pacote e para que o git versione a pasta.
+- `selectors/` contém apenas `doc.go`. É placeholder da task de scaffolding; o
+  Go exige um arquivo `.go` para que o diretório seja um pacote e para que o git
+  versione a pasta. `sources/` já está implementado (`ReadSources`) — o `doc.go`
+  dele deu lugar a `reader.go`, que carrega o doc do pacote.
 - Logs operacionais usam `log/slog` (handler JSON configurado em `main`). Não
   usar `fmt.Println`/`log.Printf`: quebra o parsing dos logs em produção.
 - Erros são embrulhados com `fmt.Errorf("pacote: ... %w", err)` e sempre citam o
