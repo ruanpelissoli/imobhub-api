@@ -27,8 +27,12 @@ Grafo de importação atual (mantê-lo acíclico e raso):
 cmd/scraper → config, db
 scraper     → httpclient, robots, ratelimit, selectors, sources   (futuro)
 selectors   → ai                                                  (futuro)
-robots      ← httpclient (apenas o User-Agent, via string)
+robots      → net/http (client próprio, timeout de 10s para o robots.txt)
 ```
+
+`robots` **não** importa `httpclient`: precisa de um timeout mais curto e o
+grafo prevê o sentido contrário. O User-Agent chega como string (de `config` ou
+de `httpclient.Client.UserAgent()`).
 
 `config` não importa nada do projeto — é a folha do grafo.
 

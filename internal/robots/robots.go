@@ -23,18 +23,19 @@ func Parse(body []byte) (*Rules, error) {
 	return &Rules{data: data}, nil
 }
 
-// AllowAll devolve regras permissivas, usadas quando o robots.txt não existe
-// (HTTP 404). Pela especificação, ausência de robots.txt significa acesso
-// liberado — o inverso (erro de rede) deve ser tratado como bloqueio pelo
-// chamador, não convertido em AllowAll.
+// AllowAll devolve regras permissivas, usadas quando não há robots.txt
+// avaliável: HTTP 404 (ausência de robots.txt significa acesso liberado pela
+// especificação) e também falhas de rede, por decisão de projeto — ver a falha
+// permissiva documentada em Checker.IsAllowed.
 func AllowAll() *Rules {
 	data, _ := robotstxt.FromStatusAndBytes(404, nil)
 	return &Rules{data: data}
 }
 
 // Allowed informa se o path pode ser acessado pelo userAgent informado.
-// Rules nulo é tratado como bloqueio: se não conseguimos avaliar o robots.txt,
-// não raspamos.
+// Rules nulo é tratado como bloqueio — rede de proteção contra um *Rules
+// esquecido sem inicializar. Checker nunca devolve Rules nulo: falha de busca
+// vira AllowAll, não nil.
 func (r *Rules) Allowed(userAgent, path string) bool {
 	if r == nil || r.data == nil {
 		return false
