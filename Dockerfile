@@ -29,10 +29,12 @@ RUN apk add --no-cache \
 WORKDIR /app
 
 COPY --from=build /out/scraper /app/scraper
-# Migrations e fontes são lidos em runtime a partir do working directory
-# (MIGRATIONS_DIR e SOURCES_FILE são relativos a ele).
+# Migrations, fontes e o vocabulário de comodidades são lidos em runtime a
+# partir do working directory (MIGRATIONS_DIR, SOURCES_FILE e AMENITIES_FILE são
+# relativos a ele).
 COPY migrations /app/migrations
 COPY sources.txt /app/sources.txt
+COPY configs /app/configs
 
 # Roda como root de propósito: o Chrome do container sobe com --no-sandbox
 # (ver internal/httpclient/headless.go), configuração que pressupõe root.

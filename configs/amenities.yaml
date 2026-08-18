@@ -1,0 +1,121 @@
+# Vocabulário de comodidades reconhecidas pelo internal/enrichment.
+#
+# Cada item tem:
+#   canonical — o nome que vai para listings.amenities / properties.amenities.
+#               É o valor consultado depois, então mudá-lo é mudar o dado.
+#   synonyms  — as grafias reconhecidas no texto livre do anúncio.
+#
+# O matching é case-insensitive, insensível a acento e tolerante à troca de
+# hífen por espaço ("Ar-Condicionado" == "ar condicionado"). Portanto NÃO é
+# preciso listar variações de caixa, de acento ou de hífen — só de palavra
+# (singular/plural, sinônimo regional, apelido de mercado).
+#
+# A ORDEM DESTE ARQUIVO É A ORDEM DE SAÍDA de ExtractedData.Amenities. Ela é o
+# contrato de determinismo dos testes: inserir no meio muda a ordem do resultado.
+#
+# Cada sinônimo é ancorado em limite de palavra, então precisa começar e
+# terminar com caractere de palavra (letra ou dígito). "24h" vale; "24h." não.
+#
+# Não há tratamento de negação: "sem piscina" casa com piscina. Ver
+# internal/enrichment/CLAUDE.md.
+
+amenities:
+  - canonical: piscina
+    synonyms:
+      - piscina
+      - piscinas
+      - piscina aquecida
+      - piscina coberta
+
+  - canonical: academia
+    synonyms:
+      - academia
+      - espaço fitness
+      - sala de ginástica
+      - fitness center
+
+  - canonical: churrasqueira
+    synonyms:
+      - churrasqueira
+      - churrasqueiras
+      - espaço gourmet
+      - área de churrasco
+
+  - canonical: portaria 24h
+    synonyms:
+      - portaria 24h
+      - portaria 24 horas
+      - portaria 24hs
+      - portaria eletrônica
+      - porteiro 24 horas
+      - segurança 24 horas
+
+  - canonical: elevador
+    synonyms:
+      - elevador
+      - elevadores
+      - elevador social
+
+  - canonical: ar-condicionado
+    synonyms:
+      - ar condicionado
+      - ar-condicionado
+      - climatizado
+      - climatização
+      - split
+
+  - canonical: varanda
+    synonyms:
+      - varanda
+      - varandas
+      - varanda gourmet
+      - sacada
+      - terraço
+
+  - canonical: pet friendly
+    synonyms:
+      - pet friendly
+      - aceita pets
+      - aceita animais
+      - permitido animais
+
+  - canonical: salão de festas
+    synonyms:
+      - salão de festas
+      - salao de festas
+      - espaço festas
+      - salão social
+
+  - canonical: playground
+    synonyms:
+      - playground
+      - parquinho
+      - brinquedoteca
+
+  - canonical: sauna
+    synonyms:
+      - sauna
+      - saunas
+      - sauna seca
+      - sauna úmida
+
+  - canonical: área de serviço
+    synonyms:
+      - área de serviço
+      - area de servico
+      - lavanderia
+
+  - canonical: vaga coberta
+    synonyms:
+      - vaga coberta
+      - vagas cobertas
+      - garagem coberta
+      - estacionamento coberto
+
+  - canonical: mobiliado
+    synonyms:
+      - mobiliado
+      - mobiliada
+      - semimobiliado
+      - semi mobiliado
+      - totalmente mobiliado
