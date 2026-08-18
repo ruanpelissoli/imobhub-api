@@ -24,7 +24,7 @@ orquestra; a lógica está aqui.
 Grafo de importação atual (mantê-lo acíclico e raso):
 
 ```
-cmd/scraper → config, db
+cmd/scraper → config, db, ratelimit
 scraper     → httpclient, robots, ratelimit, selectors, sources   (futuro)
 selectors   → ai                                                  (futuro)
 robots      → net/http (client próprio, timeout de 10s para o robots.txt)
