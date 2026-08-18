@@ -1,0 +1,73 @@
+# Stack local do ImobHub: PostgreSQL, Redis e a aplicação.
+#
+# Uso:
+#   cp .env.example .env   # preencha ANTHROPIC_API_KEY
+#   docker compose up -d db redis   # sobe só a infra (rode a app com `go run`)
+#   docker compose run --rm api     # executa uma coleta completa no container
+#
+# A app é um processo batch (uma execução = uma coleta de todas as fontes e
+# sai), por isso `restart: no` e o uso de `run`/`up api` em vez de um serviço
+# sempre ligado.
+
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: imobhub-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-imobhub}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-imobhub}
+      POSTGRES_DB: ${POSTGRES_DB:-imobhub}
+    ports:
+      # Exposto no host para que `go run ./cmd/scraper` e clientes SQL alcancem
+      # o banco com o DATABASE_URL do .env.
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # `api` espera este healthcheck: as migrations rodam no startup e falham
+      # se o Postgres ainda estiver inicializando.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-imobhub} -d ${POSTGRES_DB:-imobhub}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: imobhub-redis
+    # appendonly liga a persistência: reiniciar o container não zera o que
+    # estiver em cache/fila.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: imobhub-api
+    env_file:
+      - .env
+    environment:
+      # Sobrescrevem o .env dentro da rede do compose: no host os serviços são
+      # localhost, aqui são os nomes dos serviços. `environment` tem precedência
+      # sobre `env_file`, então o mesmo .env serve para os dois modos de execução.
+      DATABASE_URL: postgres://${POSTGRES_USER:-imobhub}:${POSTGRES_PASSWORD:-imobhub}@db:5432/${POSTGRES_DB:-imobhub}?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  pgdata:
+  redisdata:

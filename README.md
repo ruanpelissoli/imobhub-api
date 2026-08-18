@@ -36,10 +36,39 @@ mais comum de o build funcionar local e a renderização falhar em produção.
 
 ## Configuração
 
-Copie `.env.example` para `.env` e preencha os valores. Todas as variáveis são
-lidas por `internal/config`; nenhum outro pacote chama `os.Getenv`.
+Copie `.env.example` para `.env` e preencha os valores (na prática, só a
+`ANTHROPIC_API_KEY`: os demais defaults já apontam para os serviços do
+`docker-compose.yml`). As variáveis da aplicação são lidas por
+`internal/config`; nenhum outro pacote chama `os.Getenv`. As variáveis
+`POSTGRES_*` e `*_PORT` existem apenas para o compose.
+
+## Ambiente local com Docker
+
+O `docker-compose.yml` sobe a stack completa: `db` (PostgreSQL), `redis` e
+`api` (a aplicação).
+
+```bash
+cp .env.example .env            # preencha ANTHROPIC_API_KEY
+docker compose up -d db redis   # só a infraestrutura
+docker compose run --rm api     # executa uma coleta dentro do container
+docker compose down             # para tudo (-v também apaga os volumes)
+```
+
+A `api` é um processo batch: uma execução coleta todas as fontes e sai — por
+isso `restart: "no"` e o uso de `run` em vez de um serviço sempre ligado. Ela só
+inicia depois que os healthchecks de `db` e `redis` passam, porque as migrations
+rodam no startup.
+
+O mesmo `.env` serve para os dois modos de execução: os valores apontam para
+`localhost` (para `go run` no host) e o serviço `api` sobrescreve
+`DATABASE_URL`/`REDIS_URL` com os nomes de host da rede do compose.
+
+> O Redis ainda não é consumido por nenhum pacote Go — está no compose como
+> infraestrutura prevista para cache/fila.
 
 ## Executar
+
+Com a infra do compose no ar (ou um Postgres próprio na `DATABASE_URL`):
 
 ```bash
 go run ./cmd/scraper
