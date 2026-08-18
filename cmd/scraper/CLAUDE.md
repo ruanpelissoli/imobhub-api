@@ -2,8 +2,9 @@
 
 ## Purpose
 Ponto de entrada do coletor. Responsável apenas por: configurar o logger, ler a
-configuração, abrir o pool do banco e (futuramente) disparar a coleta. Nenhuma
-regra de negócio mora aqui — ela vive em `internal/`.
+configuração, abrir o pool do banco, aplicar as migrations e disparar a coleta
+(`scraper.RunPipeline`). Nenhuma regra de negócio mora aqui — ela vive em
+`internal/`.
 
 ## Key decisions
 - **`main` delega para `run() error`.** `os.Exit` **não** executa os `defer`
@@ -21,11 +22,13 @@ regra de negócio mora aqui — ela vive em `internal/`.
   ordenado em vez de kill abrupto. SIGTERM é o sinal que orquestradores de
   container enviam.
 
-- **O `ratelimit.DomainLimiter` é criado aqui, uma vez só.** O espaçamento por
-  domínio só existe se todas as requisições passarem pelo mesmo limiter: dois
-  limiters teriam relógios independentes e dobrariam a carga na fonte. Por isso
-  ele nasce em `run` e será injetado no pipeline, em vez de ser construído dentro
-  de cada componente.
+- **A montagem dos módulos de coleta saiu daqui.** O `ratelimit.DomainLimiter`,
+  o `robots.Checker`, os clientes HTTP e o serviço de seletores nascem em
+  `scraper.NewPipeline`: a assinatura exigida `RunPipeline(ctx, cfg, pool)` não
+  tem por onde recebê-los prontos, e escolher esses colaboradores é regra de
+  coleta, que este pacote não guarda. A invariante do limiter continua valendo —
+  ele é **um por run**, compartilhado por todas as fontes, porque dois limiters
+  teriam relógios independentes e dobrariam a carga na fonte.
 
 ## Business logic / invariantes
 - Ordem de inicialização é obrigatória: **config → db → migrations → coleta**. A
@@ -40,14 +43,18 @@ regra de negócio mora aqui — ela vive em `internal/`.
   — o contrato de `Connect` é fechar o pool sozinho em caso de erro.
 
 ## Gotchas
-- Este binário ainda não faz coleta: ele sobe, valida config e conexão, aplica
-  as migrations, loga e encerra com sucesso. É o suficiente para
-  `go build ./...` e para um healthcheck de deploy, mas não confunda "processo
-  saiu com 0" com "coletou alguma coisa".
+- **Exit code 0 não significa "coletou alguma coisa".** `RunPipeline` só devolve
+  erro em falha fatal (config, banco, arquivo de fontes ilegível, SIGTERM); uma
+  fonte que falhou vira log de erro e uma linha no resumo, sem mudar o exit code
+  — foi decisão de projeto para que um portal fora do ar não marque o run
+  inteiro como falho. Quem monitora deve ler o resumo (`failed`, `succeeded`),
+  não só o código de saída.
+- `go run ./cmd/scraper` executa a coleta completa: exige `DATABASE_URL`,
+  `ANTHROPIC_API_KEY` e — para as fontes `headless` — Chrome/Chromium no PATH.
 - Como cada execução aplica migrations, subir o binário **altera o schema**. Não
   aponte um processo de versão antiga para um banco já migrado por uma versão
   nova esperando que ele reverta: não há `down`.
 
 ## Dependencies
-`internal/config`, `internal/db`, `internal/ratelimit`. Deve permanecer fino — se lógica começar a se
-acumular aqui, mova para um pacote em `internal/`.
+`internal/config`, `internal/db` e `internal/scraper`. Deve permanecer fino — se
+lógica começar a se acumular aqui, mova para um pacote em `internal/`.

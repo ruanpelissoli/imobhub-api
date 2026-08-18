@@ -1,15 +1,61 @@
 # internal/scraper
 
 ## Purpose
-Orquestrará a coleta das páginas das fontes: robots.txt, rate limiting, busca do
-HTML e extração dos dados. Implementado hoje:
+Orquestra a coleta das páginas das fontes: robots.txt, rate limiting, busca do
+HTML, extração dos dados e sincronização com o banco.
+- **orquestração** (`pipeline.go`): `RunPipeline` monta os módulos de coleta e
+  processa as fontes do arquivo uma a uma — é o que `cmd/scraper` executa;
 - **extração** (`extractor.go`): `ExtractListings` converte o HTML de uma página
   de listagem em `[]db.RawListing` aplicando os seletores CSS salvos em
   `site_selectors`;
 - **sincronização** (`syncer.go`): `SyncListings` reconcilia esses anúncios com
   o banco — grava os vistos agora e apaga os que sumiram do site.
 
-A orquestração que costura busca, extração e sincronização ainda não existe.
+## Business logic (`RunPipeline`)
+Por fonte, em ordem: domínio ← host da URL (minúsculo) → `robots.IsAllowed` →
+`limiter.Wait` → carimbo do `runStartedAt` → `EnsureSelectors` → busca do HTML
+pelo `render_mode` → `ExtractListings` → (se zero: `RecoverSelectors`, re-busca,
+re-extração) → `SyncListings` → log `[domínio] ✓ N listings (...)`.
+- **Uma fonte com problema nunca derruba o run**: é logada com o domínio,
+  contada no resumo e o pipeline segue — um portal fora do ar não pode zerar a
+  coleta do dia. `Run` só erra no que é fatal: arquivo de fontes ilegível,
+  wiring incompleto, contexto cancelado. **Cancelamento encerra o run** (checado
+  entre as fontes e após cada falha): insistir viraria uma cascata de erros
+  idênticos que esconde a causa real.
+- **`runStartedAt` é carimbado por domínio**, imediatamente antes de processá-lo
+  — contrato de `SyncListings`. Não reaproveite um corte global.
+- **Zero anúncios ⇒ redescoberta, não DELETE.** Se ainda vier zero depois dela, a
+  fonte falha **e** os seletores viram `broken` (`db.MarkSelectorsBroken`):
+  `RecoverSelectors` acabou de gravar a linha como `valid`, e sem a marcação o
+  run seguinte reusaria seletores que já sabemos não extrair nada.
+- **Bloqueio por robots.txt é `Warn` e não conta como falha** — o site pediu para
+  não ser coletado e nós obedecemos. A checagem vem antes do rate limiting e da
+  descoberta: não se requisita um site proibido nem para descobrir como lê-lo.
+- **`Wait` é chamado duas vezes por fonte** (início do domínio e antes da busca
+  da página): `EnsureSelectors`/`RecoverSelectors` buscam o HTML por conta
+  própria no meio. Esperar a mais é boa vizinhança; a menos é levar bloqueio.
+- **Domínio = host minúsculo, com porta e com `www`** — é a chave de
+  `site_selectors` e de `listings.source_domain`; duas grafias do mesmo host
+  viveriam como duas fontes, com dois catálogos.
+- Os logs `[domínio] ✓ %d listings (upserted: %d, deletados: %d)` e
+  `[domínio] bloqueado por robots.txt` são contratuais e têm teste.
+
+## Key decisions (`pipeline.go`)
+- **Fontes sequenciais.** O rate limit é por domínio (fontes não competem entre
+  si), então paralelizar só ganharia em sites lentos — contra N Chromes headless
+  simultâneos e erros entrelaçados no log. Fica para quando o volume justificar.
+- **O wiring mora em `NewPipeline`, não no `main`.** A assinatura exigida
+  (`ctx, cfg, pool`) não recebe módulos prontos, e `cmd/scraper/CLAUDE.md` proíbe
+  regra de negócio lá. O `DomainLimiter` passou a nascer aqui, ainda **um por
+  run** (dois teriam relógios independentes e dobrariam a carga na fonte).
+- **Dependências como campos de função em `Deps`, não interfaces** — cada
+  colaborador tem uma operação só, e o pacote já usa esse estilo. O ganho é o
+  teste: um closure por campo, sem mock, sem rede, sem PostgreSQL e sem gastar
+  tokens da Anthropic. `New` rejeita campo nulo, que viraria panic na 1ª coleta.
+- **`Run` devolve `RunSummary`; `RunPipeline` descarta** — o binário só precisa do
+  exit code, mas os números são o que os testes verificam.
+- **Falha na contagem do resumo (`db.CountListings`) não derruba o run**: o
+  número é informativo, e perder o resumo inteiro por causa dele seria pior.
 
 ## Business logic (`ExtractListings`)
 - **Função pura**: sem banco, sem rede. Entra HTML + `db.SelectorConfig` + host,
@@ -97,6 +143,11 @@ A orquestração que costura busca, extração e sincronização ainda não exis
 - **`SyncStats.Upserted` é `len(extracted)`, não linhas afetadas pelo banco:** o
   `ON CONFLICT` não distingue insert de update. O número responde "quantos
   anúncios o domínio tinha agora", não "quantos são novos".
+- **O pipeline não valida a URL final após redirecionamento.** Os fetchers usados
+  aqui descartam a `finalURL` (contrato de `selectors.PageFetcher`): a identidade
+  da fonte continua sendo o host do `sources.txt`, mesmo que o site redirecione
+  para outro domínio. É proposital — trocar a identidade no meio do run gravaria
+  seletores e anúncios sob um domínio que ninguém configurou.
 - **O `domain` de `SyncListings` precisa ser o mesmo texto gravado em
   `listings.source_domain`.** Divergência não dá erro: o DELETE filtra outra
   coisa e sai com zero deletados, e os anúncios velhos ficam no banco para
@@ -107,7 +158,8 @@ A orquestração que costura busca, extração e sincronização ainda não exis
 ## Dependencies
 `goquery` + `cascadia` (dependência direta desde a task da extração, para
 compilar os seletores e detectar CSS inválido), `internal/db`
-(`SelectorConfig`, `RawListing`, `UpsertListings`, `DeleteStaleListings`) e
-`pgxpool`. Passará a importar `httpclient`, `robots`, `ratelimit`, `sources` e
-`selectors` conforme a orquestração for implementada. Consumido pelo pipeline de
-coleta em `cmd/scraper`.
+(`SelectorConfig`, `RawListing`, `UpsertListings`, `DeleteStaleListings`,
+`MarkSelectorsBroken`, `CountListings`) e `pgxpool`. Desde `pipeline.go` também
+`internal/config`, `internal/sources`, `internal/robots`, `internal/ratelimit` e
+`internal/selectors` (de onde vêm os adaptadores `StaticFetcher`/`HeadlessFetcher`
+sobre `httpclient`). Consumido por `cmd/scraper`, que só chama `RunPipeline`.

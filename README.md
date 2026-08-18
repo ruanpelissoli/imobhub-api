@@ -45,6 +45,13 @@ lidas por `internal/config`; nenhum outro pacote chama `os.Getenv`.
 go run ./cmd/scraper
 ```
 
+Uma execução aplica as migrations pendentes e coleta **todas** as fontes do
+`sources.txt`, uma de cada vez: robots.txt, rate limiting por domínio,
+seletores (reusados do banco ou descobertos via Claude), extração e
+sincronização com a tabela `listings`. Ao final, o resumo do run sai no log.
+Uma fonte que falha não interrompe as demais e **não** muda o exit code — o
+processo só sai com 1 em erro fatal (config, banco, arquivo de fontes ilegível).
+
 ## Testes
 
 ```bash
