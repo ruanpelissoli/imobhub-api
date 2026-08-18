@@ -37,9 +37,11 @@ de `httpclient.Client.UserAgent()`).
 `config` não importa nada do projeto — é a folha do grafo.
 
 ## Gotchas
-- `selectors/` contém apenas `doc.go`. É placeholder da task de scaffolding; o
-  Go exige um arquivo `.go` para que o diretório seja um pacote e para que o git
-  versione a pasta. `sources/` já está implementado (`ReadSources`) — o `doc.go`
+- `selectors/` e `scraper/` contêm apenas `doc.go`. São placeholders; o Go exige
+  um arquivo `.go` para que o diretório seja um pacote e para que o git versione
+  a pasta. O `scraper.RenderHTML` que existia no scaffolding virou
+  `httpclient.FetchHeadless` — busca de página (estática ou headless) é
+  responsabilidade de `httpclient`. `sources/` já está implementado (`ReadSources`) — o `doc.go`
   dele deu lugar a `reader.go`, que carrega o doc do pacote.
 - Logs operacionais usam `log/slog` (handler JSON configurado em `main`). Não
   usar `fmt.Println`/`log.Printf`: quebra o parsing dos logs em produção.
