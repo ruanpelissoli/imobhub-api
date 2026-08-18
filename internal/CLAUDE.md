@@ -29,6 +29,7 @@ scraper     → config, db, ratelimit, robots, selectors, sources, pgxpool
 selectors   → ai, db, httpclient
 ai          → db          (SelectorFields e as constantes de render mode)
 robots      → net/http (client próprio, timeout de 10s para o robots.txt)
+enrichment  → stdlib + x/text (normalização pura; não importa nada do projeto)
 ```
 
 `scraper` chega a `httpclient` **através** de `selectors.StaticFetcher`/
@@ -40,7 +41,10 @@ mesmo jeito.
 grafo prevê o sentido contrário. O User-Agent chega como string (de `config` ou
 de `httpclient.Client.UserAgent()`).
 
-`config` não importa nada do projeto — é a folha do grafo.
+`config` e `enrichment` não importam nada do projeto — são as folhas do grafo.
+`enrichment` é puro de propósito (sem banco, sem rede, sem IA) e carrega sua
+tabela de aliases embutida com `//go:embed`, para não virar mais uma variável de
+ambiente nem mais um `COPY` no Dockerfile.
 
 ## Gotchas
 - `selectors/` já está implementado (`SelectorService`: reuso da linha
@@ -56,6 +60,12 @@ de `httpclient.Client.UserAgent()`).
   `httpclient.FetchHeadless` — busca de página (estática ou headless) é
   responsabilidade de `httpclient`. `sources/` já está implementado (`ReadSources`) — o `doc.go`
   dele deu lugar a `reader.go`, que carrega o doc do pacote.
+- `enrichment/` entrega hoje só o normalizador de bairros
+  (`NeighborhoodNormalizer.Normalize`) e **ainda não tem chamador**. Persistir
+  `listings.normalized_neighborhood` — fila por `enriched_at IS NULL`, função de
+  UPDATE em `db` e wiring em `cmd/scraper` — é task de follow-up, compartilhada
+  com os demais campos de enriquecimento (`bedroom_count`, `amenities`,
+  `lat`/`lng`). Não duplicar esse plumbing por enricher.
 - Logs operacionais usam `log/slog` (handler JSON configurado em `main`). Não
   usar `fmt.Println`/`log.Printf`: quebra o parsing dos logs em produção.
 - Erros são embrulhados com `fmt.Errorf("pacote: ... %w", err)` e sempre citam o
