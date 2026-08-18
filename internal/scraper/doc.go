@@ -8,5 +8,7 @@
 //
 // Implementado até aqui: ExtractListings (extractor.go), a etapa que transforma
 // o HTML de uma página de listagem em []db.RawListing usando os seletores CSS
-// salvos. A orquestração da coleta chega nas tasks seguintes.
+// salvos, e SyncListings (syncer.go), que reconcilia esses anúncios com o banco
+// — grava os vistos agora e apaga os que sumiram do site. A orquestração que
+// costura busca, extração e sincronização chega nas tasks seguintes.
 package scraper

@@ -25,7 +25,7 @@ Grafo de importação atual (mantê-lo acíclico e raso):
 
 ```
 cmd/scraper → config, db, ratelimit
-scraper     → db (models)
+scraper     → db (models + repositórios de listings), pgxpool
 scraper     → httpclient, robots, ratelimit, selectors, sources   (futuro)
 selectors   → ai, db, httpclient
 ai          → db          (SelectorFields e as constantes de render mode)
@@ -42,7 +42,9 @@ de `httpclient.Client.UserAgent()`).
 - `selectors/` já está implementado (`SelectorService`: reuso da linha
   de `site_selectors` e descoberta via `ai` quando ela falta ou está quebrada) —
   o `doc.go` de lá agora só carrega o doc do pacote.
-  `scraper/` já tem a extração (`ExtractListings`), mas ainda não a
+  `scraper/` já tem a extração (`ExtractListings`) e a sincronização com o banco
+  (`SyncListings` — grava o que foi visto e apaga o que sumiu do site, **nunca**
+  deletando quando a coleta devolveu zero anúncios), mas ainda não a
   orquestração. O `scraper.RenderHTML` que existia no scaffolding virou
   `httpclient.FetchHeadless` — busca de página (estática ou headless) é
   responsabilidade de `httpclient`. `sources/` já está implementado (`ReadSources`) — o `doc.go`
