@@ -119,4 +119,6 @@ structs em `models.go` são o contrato compartilhado com `ai`, `selectors` e
 `github.com/jackc/pgx/v5` e `pgxpool`. Importado por `cmd/scraper`; os pacotes
 `selectors`, `ai` e `scraper` consomem `SelectorConfig`/`RawListing` daqui. Os
 arquivos de schema ficam em `migrations/` na raiz — ver o CLAUDE.md de lá para
-as regras das tabelas `site_selectors` e `listings`.
+as regras das tabelas `site_selectors`, `listings` (incluindo as colunas de
+enriquecimento) e `properties`. `properties` ainda **não** tem struct em
+`models.go` nem repositório aqui: por enquanto existe só no schema.

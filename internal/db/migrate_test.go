@@ -108,7 +108,12 @@ func TestRepositoryMigrationsAreValid(t *testing.T) {
 		t.Fatalf("collectMigrations() on repository migrations error = %v, want nil", err)
 	}
 
-	want := []string{"001_create_site_selectors.sql", "002_create_listings.sql"}
+	want := []string{
+		"001_create_site_selectors.sql",
+		"002_create_listings.sql",
+		"003_create_properties.sql",
+		"004_enrich_listings.sql",
+	}
 	for i, name := range want {
 		if i >= len(migrations) {
 			t.Fatalf("migration %q is missing", name)
