@@ -49,8 +49,9 @@ mapeamento conhecido.
 
 ## Dependencies
 `github.com/anthropics/anthropic-sdk-go` (+ `/option`) e `internal/db` (para
-`SelectorFields` e as constantes de render mode). Será importado por
-`internal/selectors`.
+`SelectorFields` e as constantes de render mode). Importado por
+`internal/selectors` (`SelectorService`), que é quem decide **quando** pagar uma
+análise: só em fonte nova ou com seletores quebrados.
 
 ## Gotchas
 - **Este pacote gasta dinheiro.** `AnalyzeSelectors` faz uma chamada real e
