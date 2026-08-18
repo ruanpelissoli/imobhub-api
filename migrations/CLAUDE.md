@@ -37,6 +37,24 @@ tabelas são o contrato que todas as queries `pgx` assumem.
   apagados.
 - `UNIQUE (source_domain, listing_url)` (`listings_source_domain_listing_url_key`)
   é a identidade do anúncio e o alvo do `ON CONFLICT` nos upserts.
+- `properties`: **registro canônico do imóvel**. Relação 1:N com `listings` —
+  o mesmo imóvel físico é anunciado em vários portais, cada anúncio é uma linha
+  em `listings` e todos apontam para uma linha em `properties`. `listings`
+  guarda o bruto de cada fonte; `properties`, a versão consolidada.
+- `properties.transaction_type` e `property_type` são `TEXT` **livre de
+  propósito**: o vocabulário válido ainda não foi definido. CHECK/enum entram
+  quando os valores estiverem fechados — restringir antes disso derrubaria a
+  coleta na primeira variação inesperada.
+- **Não existe chave de deduplicação em `properties`** (nenhum UNIQUE além da
+  PK), também de propósito: a regra de matching é decidida na task de
+  deduplicação. Uma chave inventada agora rejeitaria imóveis legítimos.
+- `properties.active_listing_count` é **denormalizado**: quem altera
+  `listings.property_id` é responsável por mantê-lo coerente. Existe para a
+  listagem não fazer um `COUNT` em `listings` a cada consulta.
+- Colunas de enriquecimento em `listings` (`normalized_neighborhood`,
+  `bedroom_count`, `amenities`, `lat`, `lng`, `property_id`, `enriched_at`) são
+  derivadas dos campos `_raw` — que continuam intocados, para permitir
+  reprocessar quando a normalização mudar. Todas nullable e sem backfill.
 
 ## Gotchas
 - **`updated_at` não tem trigger.** É `NOT NULL DEFAULT NOW()` apenas no INSERT;
@@ -48,4 +66,19 @@ tabelas são o contrato que todas as queries `pgx` assumem.
   afins não funcionam aqui. Se algum dia forem necessários, o runner precisará
   de um modo fora de transação.
 - `image_urls TEXT[]` e `extra_data JSONB` têm default `'{}'` mas aceitam NULL —
-  ao ler, trate NULL e vazio da mesma forma.
+  ao ler, trate NULL e vazio da mesma forma. Vale igual para
+  `properties.amenities`/`photos` (default `'{}'`) e para `listings.amenities`
+  (sem default, adicionada em tabela já populada).
+- **Nunca crie arquivos `.down.sql`.** Não há conceito de rollback no runner, e
+  `003_x.down.sql` casaria com o regex de nome com a **mesma versão** de
+  `003_x.sql` — versão duplicada faz o startup falhar. Correção sempre em
+  arquivo novo.
+- `listings.property_id` usa `ON DELETE SET NULL` **intencionalmente**: apagar
+  um `property` não pode apagar os anúncios brutos coletados, que são o dado de
+  origem e não se recuperam sem nova raspagem.
+- `idx_properties_lat_lng` é um **btree composto, não um índice geoespacial**
+  (PostGIS não faz parte da stack). Serve para filtro por faixa de
+  latitude/longitude; busca por raio exigirá outro índice.
+- `listings.enriched_at IS NULL` = anúncio pendente de enriquecimento. É o
+  filtro da fila; comparar com `updated_at` diz se o anúncio mudou desde o
+  último passe.
