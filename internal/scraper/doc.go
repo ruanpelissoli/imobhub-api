@@ -6,5 +6,7 @@
 // modos de busca no mesmo pacote evita duas implementações de chromedp e deixa
 // a escolha "estático ou headless" numa decisão só.
 //
-// Ainda não implementado: a orquestração chega nas tasks seguintes.
+// Implementado até aqui: ExtractListings (extractor.go), a etapa que transforma
+// o HTML de uma página de listagem em []db.RawListing usando os seletores CSS
+// salvos. A orquestração da coleta chega nas tasks seguintes.
 package scraper
