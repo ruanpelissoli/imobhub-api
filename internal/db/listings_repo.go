@@ -55,6 +55,13 @@ const deleteStaleListingsSQL = `
 DELETE FROM listings
 WHERE source_domain = $1 AND last_seen_at < $2`
 
+// countListingsSQL conta o catálogo inteiro. COUNT(*) exato (e não a estimativa
+// de pg_class.reltuples) porque o número vai para o resumo do run, que é o
+// indicador que o operador acompanha entre execuções — uma estimativa que oscila
+// sem que nada tenha mudado destruiria a confiança nele. A tabela tem ordem de
+// dezenas de milhares de linhas; o custo do seq scan é irrelevante uma vez por run.
+const countListingsSQL = `SELECT COUNT(*) FROM listings`
+
 // UpsertListings insere ou atualiza os anúncios recebidos, renovando
 // last_seen_at de cada um.
 //
@@ -129,6 +136,19 @@ func DeleteStaleListings(ctx context.Context, pool *pgxpool.Pool, domain string,
 	}
 
 	return tag.RowsAffected(), nil
+}
+
+// CountListings devolve quantos anúncios existem hoje na tabela listings,
+// somando todos os domínios.
+//
+// Serve ao resumo do fim da coleta, não a decisões de negócio: é uma foto tirada
+// depois da sincronização de todas as fontes, e o número muda a cada run.
+func CountListings(ctx context.Context, pool *pgxpool.Pool) (int64, error) {
+	var total int64
+	if err := pool.QueryRow(ctx, countListingsSQL).Scan(&total); err != nil {
+		return 0, fmt.Errorf("db: could not count listings: %w", err)
+	}
+	return total, nil
 }
 
 // execUpsertBatch envia um lote de upserts pelo pipeline do pgx e consome um

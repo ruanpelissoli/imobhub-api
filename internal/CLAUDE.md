@@ -24,13 +24,17 @@ orquestra; a lógica está aqui.
 Grafo de importação atual (mantê-lo acíclico e raso):
 
 ```
-cmd/scraper → config, db, ratelimit
-scraper     → db (models + repositórios de listings), pgxpool
-scraper     → httpclient, robots, ratelimit, selectors, sources   (futuro)
+cmd/scraper → config, db, scraper
+scraper     → config, db, ratelimit, robots, selectors, sources, pgxpool
 selectors   → ai, db, httpclient
 ai          → db          (SelectorFields e as constantes de render mode)
 robots      → net/http (client próprio, timeout de 10s para o robots.txt)
 ```
+
+`scraper` chega a `httpclient` **através** de `selectors.StaticFetcher`/
+`HeadlessFetcher`: os adaptadores já fecham sobre o User-Agent, e reusá-los
+garante que a página analisada pela IA e a página coletada sejam buscadas do
+mesmo jeito.
 
 `robots` **não** importa `httpclient`: precisa de um timeout mais curto e o
 grafo prevê o sentido contrário. O User-Agent chega como string (de `config` ou
@@ -42,10 +46,13 @@ de `httpclient.Client.UserAgent()`).
 - `selectors/` já está implementado (`SelectorService`: reuso da linha
   de `site_selectors` e descoberta via `ai` quando ela falta ou está quebrada) —
   o `doc.go` de lá agora só carrega o doc do pacote.
-  `scraper/` já tem a extração (`ExtractListings`) e a sincronização com o banco
+  `scraper/` está completo: extração (`ExtractListings`), sincronização
   (`SyncListings` — grava o que foi visto e apaga o que sumiu do site, **nunca**
-  deletando quando a coleta devolveu zero anúncios), mas ainda não a
-  orquestração. O `scraper.RenderHTML` que existia no scaffolding virou
+  deletando quando a coleta devolveu zero anúncios) e a orquestração
+  (`RunPipeline`), que é o que `cmd/scraper` executa. O wiring dos módulos de
+  coleta vive em `scraper.NewPipeline`, não no `main`: a assinatura
+  `RunPipeline(ctx, cfg, pool)` não recebe módulos prontos e o `main` não guarda
+  regra de negócio. O `scraper.RenderHTML` que existia no scaffolding virou
   `httpclient.FetchHeadless` — busca de página (estática ou headless) é
   responsabilidade de `httpclient`. `sources/` já está implementado (`ReadSources`) — o `doc.go`
   dele deu lugar a `reader.go`, que carrega o doc do pacote.

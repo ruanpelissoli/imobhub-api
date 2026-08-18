@@ -10,7 +10,7 @@ import (
 
 	"github.com/imobhub/api/internal/config"
 	"github.com/imobhub/api/internal/db"
-	"github.com/imobhub/api/internal/ratelimit"
+	"github.com/imobhub/api/internal/scraper"
 )
 
 func main() {
@@ -50,15 +50,15 @@ func run() error {
 		return err
 	}
 
-	// Uma única instância compartilhada por todo o pipeline: o espaçamento por
-	// domínio só funciona se todas as requisições passarem pelo mesmo limiter.
-	limiter := ratelimit.NewDomainLimiter(int(cfg.ScraperRateLimit.Milliseconds()))
-
 	slog.Info("imobhub scraper started",
 		"sources_file", cfg.SourcesFile,
 		"user_agent", cfg.ScraperUserAgent,
-		"rate_limit", limiter.Interval().String(),
+		"rate_limit", cfg.ScraperRateLimit.String(),
 	)
 
-	return nil
+	// A montagem dos módulos de coleta (robots checker, rate limiter, clientes
+	// HTTP, serviço de seletores, extrator, sincronizador) mora em
+	// scraper.RunPipeline: escolher esses colaboradores é regra de coleta, e
+	// este pacote não guarda regra de negócio.
+	return scraper.RunPipeline(ctx, cfg, pool)
 }

@@ -47,6 +47,11 @@ structs em `models.go` são o contrato compartilhado com `ai`, `selectors` e
   processo: uma imagem Docker precisa copiar `migrations/` junto do binário.
 
 ## Repositórios (`models.go`, `selectors_repo.go`, `listings_repo.go`)
+- **`CountListings` usa `COUNT(*)` exato, não a estimativa de
+  `pg_class.reltuples`.** O número vai para o resumo do run, que é o indicador
+  acompanhado entre execuções: uma estimativa que oscila sem nada ter mudado
+  destruiria a confiança nele. É uma query por run, sobre uma tabela na ordem de
+  dezenas de milhares de linhas.
 - **Funções livres recebendo `*pgxpool.Pool`**, sem struct `Repository` nem
   interface. Não há o que injetar: um pacote, um banco, nenhum estado por
   repositório. A interface pode nascer no consumidor no dia em que houver dois
