@@ -19,12 +19,14 @@ const (
 	DefaultUserAgent     = "ImobHubBot/1.0"
 	DefaultRateLimitMS   = 2000
 	DefaultMigrationsDir = "migrations"
+	DefaultAmenitiesFile = "configs/amenities.yaml"
 	envDatabaseURL       = "DATABASE_URL"
 	envAnthropicAPIKey   = "ANTHROPIC_API_KEY"
 	envSourcesFile       = "SOURCES_FILE"
 	envScraperUserAgent  = "SCRAPER_USER_AGENT"
 	envScraperRateLimit  = "SCRAPER_RATE_LIMIT_MS"
 	envMigrationsDir     = "MIGRATIONS_DIR"
+	envAmenitiesFile     = "AMENITIES_FILE"
 )
 
 // Config agrupa toda a configuração de runtime do scraper.
@@ -44,6 +46,9 @@ type Config struct {
 	// MigrationsDir é o diretório com os arquivos .sql de migration aplicados
 	// no startup. Relativo ao working directory do processo.
 	MigrationsDir string
+	// AmenitiesFile é o caminho do arquivo YAML com o vocabulário de comodidades
+	// usado pelo pacote enrichment. Relativo ao working directory do processo.
+	AmenitiesFile string
 }
 
 // ErrMissingRequired indica que uma ou mais variáveis obrigatórias não foram
@@ -89,6 +94,7 @@ func Load() (*Config, error) {
 		ScraperUserAgent: lookup(envScraperUserAgent, DefaultUserAgent),
 		ScraperRateLimit: time.Duration(rateLimitMS) * time.Millisecond,
 		MigrationsDir:    lookup(envMigrationsDir, DefaultMigrationsDir),
+		AmenitiesFile:    lookup(envAmenitiesFile, DefaultAmenitiesFile),
 	}, nil
 }
 

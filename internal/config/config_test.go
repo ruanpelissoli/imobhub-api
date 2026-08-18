@@ -20,6 +20,7 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	t.Setenv(envSourcesFile, "")
 	t.Setenv(envScraperUserAgent, "")
 	t.Setenv(envScraperRateLimit, "")
+	t.Setenv(envAmenitiesFile, "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -38,6 +39,9 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if cfg.MigrationsDir != DefaultMigrationsDir {
 		t.Errorf("MigrationsDir = %q, want %q", cfg.MigrationsDir, DefaultMigrationsDir)
 	}
+	if cfg.AmenitiesFile != DefaultAmenitiesFile {
+		t.Errorf("AmenitiesFile = %q, want %q", cfg.AmenitiesFile, DefaultAmenitiesFile)
+	}
 }
 
 func TestLoadReadsOverrides(t *testing.T) {
@@ -46,6 +50,7 @@ func TestLoadReadsOverrides(t *testing.T) {
 	t.Setenv(envScraperUserAgent, "CustomBot/2.0")
 	t.Setenv(envScraperRateLimit, "500")
 	t.Setenv(envMigrationsDir, "db/migrations")
+	t.Setenv(envAmenitiesFile, "etc/amenities.yaml")
 
 	cfg, err := Load()
 	if err != nil {
@@ -63,6 +68,9 @@ func TestLoadReadsOverrides(t *testing.T) {
 	}
 	if cfg.MigrationsDir != "db/migrations" {
 		t.Errorf("MigrationsDir = %q, want %q", cfg.MigrationsDir, "db/migrations")
+	}
+	if cfg.AmenitiesFile != "etc/amenities.yaml" {
+		t.Errorf("AmenitiesFile = %q, want %q", cfg.AmenitiesFile, "etc/amenities.yaml")
 	}
 }
 

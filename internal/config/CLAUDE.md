@@ -10,7 +10,9 @@ ambiente diretamente.
   sobe.
 - **Opcionais com default:** `SOURCES_FILE` (`sources.txt`),
   `SCRAPER_USER_AGENT` (`ImobHubBot/1.0`), `SCRAPER_RATE_LIMIT_MS` (`2000`),
-  `MIGRATIONS_DIR` (`migrations`).
+  `MIGRATIONS_DIR` (`migrations`), `AMENITIES_FILE`
+  (`configs/amenities.yaml` — vocabulário de comodidades de
+  `internal/enrichment`).
 - `SCRAPER_RATE_LIMIT_MS` é convertido para `time.Duration` aqui, não nos
   chamadores: quem consome a config recebe uma duração já tipada e não precisa
   saber que a unidade original era milissegundo. `0` é aceito e desativa o rate
@@ -41,5 +43,7 @@ Importado por `cmd/scraper`.
 - `Config` não é validada além do parsing (ex.: não checamos se a
   `DATABASE_URL` é alcançável nem se `MIGRATIONS_DIR` existe). Essa validação é
   do `internal/db`, que faz `Ping` na conexão e lê o diretório de migrations.
-- Caminhos (`SOURCES_FILE`, `MIGRATIONS_DIR`) são usados como vieram: relativos
-  ao **working directory do processo**, não à raiz do repositório.
+- Caminhos (`SOURCES_FILE`, `MIGRATIONS_DIR`, `AMENITIES_FILE`) são usados como
+  vieram: relativos ao **working directory do processo**, não à raiz do
+  repositório. No container, o `Dockerfile` precisa copiar o arquivo/diretório
+  correspondente para `/app` — senão o default aponta para algo inexistente.
