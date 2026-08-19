@@ -182,6 +182,46 @@ type ListingEnrichment struct {
 	Lng *float64
 }
 
+// PropertySearchParams são os filtros da busca paginada de imóveis
+// (SearchProperties). É o contrato que o futuro handler HTTP preenche a partir
+// da query string.
+//
+// Ao contrário de Property, os campos de filtro são **valores, não ponteiros**:
+// aqui o zero value (`""`, `0`, slice vazia/nil) significa "filtro não
+// aplicado", e não "não sei". Um ponteiro só faria sentido se "filtrar por
+// exatamente zero quartos" fosse um pedido possível — não é, os filtros
+// numéricos são pisos (`>=`).
+//
+// **Não há MinPrice/MaxPrice**, e isso é decisão registrada em
+// migrations/CLAUDE.md: `properties` não tem coluna de preço, e o único dado de
+// preço no schema é `listings.price_raw TEXT` (texto bruto: "R$ 450.000", "450
+// mil"), sobre o qual nenhum filtro de faixa é possível. Os dois campos nascem
+// junto da migration que criar a coluna normalizada em `properties`.
+type PropertySearchParams struct {
+	// TransactionType e PropertyType são comparados por igualdade exata, com o
+	// mesmo vocabulário livre de Property (o pacote não valida os valores).
+	TransactionType string
+	PropertyType    string
+	// City e Neighborhood são case- e acento-sensitive (`=`), de propósito:
+	// ILIKE/unaccent inviabilizariam o btree idx_properties_search_filters, e a
+	// normalização de bairro já acontece antes, no enriquecimento.
+	City         string
+	Neighborhood string
+	// Pisos: geram `coluna >= $N`. Imóveis com a coluna NULL (ainda não
+	// consolidados) não atendem o filtro — ver SearchProperties.
+	MinBedrooms     int
+	MinBathrooms    int
+	MinParkingSpots int
+	MinArea         float64
+	// Amenities exige **todas** as comodidades pedidas (contenção `@>` sobre a
+	// coluna TEXT[]).
+	Amenities []string
+	// Page começa em 1 e PageSize tem default 20 e teto 50; valores fora da
+	// faixa são normalizados, nunca rejeitados.
+	Page     int
+	PageSize int
+}
+
 // Property é o registro canônico de um imóvel: a versão consolidada e já
 // normalizada do que vários anúncios (RawListing) dizem sobre o mesmo imóvel
 // físico. A relação é 1:N — cada linha de listings aponta para no máximo uma

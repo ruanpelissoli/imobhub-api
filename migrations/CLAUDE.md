@@ -120,13 +120,19 @@ tabelas são o contrato que todas as queries `pgx` assumem.
   `transaction_type` em `idx_properties_search_filters` e `bedroom_count` em
   `idx_properties_attributes`. Uma busca que torne a coluna líder opcional (ou
   que reordene as colunas do índice) volta a fazer sequential scan **em
-  silêncio**.
-- **Os índices do `007` ainda não têm leitor.** Não existe query nem endpoint de
-  busca no repositório; eles antecipam a implementação. Quando ela chegar,
-  revalide cada um com `EXPLAIN (ANALYZE, BUFFERS)` contra o WHERE real — é
-  exatamente o passo que faltou no `005` e que custou um índice mantido em toda
-  escrita e nunca usado. O risco é aceitável aqui porque `properties` só é
-  escrita no enriquecimento, não em toda coleta como `listings`.
+  silêncio** — e é exatamente o que `db.SearchProperties` faz: **todos** os
+  filtros são opcionais, por decisão de produto (buscar o catálogo inteiro é um
+  caso válido). Consequência aceita e registrada, não bug.
+- **O leitor dos índices do `007` é `db.SearchProperties`** (`internal/db`), que
+  monta o WHERE dinâmico da busca paginada. Ainda **não** há endpoint HTTP, e a
+  **revalidação com `EXPLAIN (ANALYZE, BUFFERS)` contra o WHERE real continua
+  pendente**: precisa de PostgreSQL com volume e é do QA. Rode-a com e sem
+  `transaction_type`/`bedroom_count` e com filtro de `amenities`; o índice que
+  não for usado vira **arquivo de migration novo** (migrations são imutáveis),
+  como o `006` corrigiu o `005`. Esse é exatamente o passo que faltou no `005` e
+  que custou um índice mantido em toda escrita e nunca usado. O risco é aceitável
+  aqui porque `properties` só é escrita no enriquecimento, não em toda coleta
+  como `listings`.
 - **Não há índice de preço, e isso é decisão, não esquecimento.** `properties`
   não tem coluna de preço; o único dado é `listings.price_raw TEXT`, texto bruto
   ("R$ 450.000", "450 mil"), sobre o qual nenhum índice de faixa é possível. O
