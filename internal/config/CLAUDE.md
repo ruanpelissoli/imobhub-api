@@ -17,7 +17,18 @@ ambiente diretamente.
   `MIGRATIONS_DIR` (`migrations`), `GEOCODING_PROVIDER` (`nominatim`),
   `GEOCODING_RATE_LIMIT_MS` (`1000`, limite de 1 req/s do Nominatim),
   `AMENITIES_FILE` (`configs/amenities.yaml` — vocabulário de comodidades de
-  `internal/enrichment`).
+  `internal/enrichment`), `GROUPING_CONFIDENCE_THRESHOLD` (`0.85`),
+  `GROUPING_RADIUS_METERS` (`100`) e `GROUPING_MAX_CANDIDATES` (`5`), lidas por
+  `internal/grouping`.
+- **As três variáveis de agrupamento são validadas no boot, sem fallback
+  silencioso.** Threshold fora de `[0,1]`, raio `<= 0` ou candidatos `<= 0` são
+  erro, citando o valor recebido. Motivo: um threshold de `8.5` (vírgula no
+  lugar do ponto) viraria "nunca agrupa" e raio/candidatos zerados desligariam
+  o agrupamento — os três casos parecem "funcionando" nos logs enquanto criam um
+  imóvel canônico duplicado por anúncio, pela coleta inteira. `parseUnitInterval`
+  e `parsePositiveInt` carregam essas regras; note que `parsePositiveInt`
+  **rejeita zero**, ao contrário de `parseRateLimitMS`, onde zero é a forma
+  documentada de desativar o espaçamento.
 - **`GEOCODING_PROVIDER` fora de `{nominatim, googlemaps}` é erro de boot**,
   nunca fallback silencioso: quem digitou "google" errado esperava as cotas e a
   precisão do Google e receberia, sem aviso, as coordenadas do Nominatim. O

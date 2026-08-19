@@ -27,7 +27,8 @@ Grafo de importação atual (mantê-lo acíclico e raso):
 cmd/scraper → config, db, scraper
 scraper     → config, db, ratelimit, robots, selectors, sources, pgxpool
 selectors   → ai, db, httpclient
-ai          → db          (SelectorFields e as constantes de render mode)
+grouping    → ai, db, pgxpool
+ai          → db          (SelectorFields, Property e as constantes de render mode)
 robots      → net/http (client próprio, timeout de 10s para o robots.txt)
 enrichment  → ratelimit, net/http (client próprio, timeout de 10s), stdlib + x/text + yaml/v4 (vocabulário de comodidades)
 ```
@@ -66,6 +67,13 @@ comodidades do `TermExtractor` chega por parâmetro de construtor (de
   `httpclient.FetchHeadless` — busca de página (estática ou headless) é
   responsabilidade de `httpclient`. `sources/` já está implementado (`ReadSources`) — o `doc.go`
   dele deu lugar a `reader.go`, que carrega o doc do pacote.
+- `grouping/` decide se um anúncio geocodificado é o mesmo imóvel de algum
+  `property` canônico (`PropertyGrouper.GroupListing`, com `ai.MatchProperty`).
+  Segue o padrão de `selectors` — orquestra `ai` + `db` — e **não** vive em
+  `enrichment` justamente porque aquele pacote não importa `db` nem `ai`. As
+  interfaces de acesso a dados são declaradas nele (consumidor); `db` continua
+  sem struct de repositório. Como os enrichers, **ainda não tem chamador**: o
+  plumbing é a mesma task de follow-up compartilhada descrita abaixo.
 - `enrichment/` entrega hoje o normalizador de bairros
   (`NeighborhoodNormalizer.Normalize`), o geocoder (`Geocoder.Geocode`, via
   Nominatim) e o extrator de termos (`TermExtractor.Extract`, quartos +

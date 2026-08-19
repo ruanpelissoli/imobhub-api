@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -28,6 +29,18 @@ const (
 	DefaultGeocodingRateLimitMS = 1000
 	DefaultAmenitiesFile        = "configs/amenities.yaml"
 
+	// DefaultGroupingConfidenceThreshold é a confiança mínima para aceitar que
+	// dois anúncios são o mesmo imóvel. 0.85 é deliberadamente alto: juntar
+	// imóveis distintos é caro de desfazer, criar um canônico duplicado não.
+	DefaultGroupingConfidenceThreshold = 0.85
+	// DefaultGroupingRadiusMeters é o raio da busca por imóveis candidatos.
+	// 100 m cobre imprecisão de geocodificação de endereço sem varrer o
+	// quarteirão inteiro.
+	DefaultGroupingRadiusMeters = 100
+	// DefaultGroupingMaxCandidates limita quantos imóveis vão para o prompt da
+	// comparação. Junto com o raio, é o controle de custo do agrupamento.
+	DefaultGroupingMaxCandidates = 5
+
 	envDatabaseURL        = "DATABASE_URL"
 	envAnthropicAPIKey    = "ANTHROPIC_API_KEY"
 	envSourcesFile        = "SOURCES_FILE"
@@ -38,6 +51,10 @@ const (
 	envGeocodingAPIKey    = "GEOCODING_API_KEY"
 	envGeocodingRateLimit = "GEOCODING_RATE_LIMIT_MS"
 	envAmenitiesFile      = "AMENITIES_FILE"
+
+	envGroupingConfidenceThreshold = "GROUPING_CONFIDENCE_THRESHOLD"
+	envGroupingRadiusMeters        = "GROUPING_RADIUS_METERS"
+	envGroupingMaxCandidates       = "GROUPING_MAX_CANDIDATES"
 )
 
 // Providers de geocodificação aceitos em GEOCODING_PROVIDER.
@@ -82,6 +99,14 @@ type Config struct {
 	// AmenitiesFile é o caminho do arquivo YAML com o vocabulário de comodidades
 	// usado pelo pacote enrichment. Relativo ao working directory do processo.
 	AmenitiesFile string
+	// GroupingConfidenceThreshold é a confiança mínima, em [0,1], para o
+	// agrupamento aceitar que um anúncio é o mesmo imóvel de um candidato.
+	GroupingConfidenceThreshold float64
+	// GroupingRadiusMeters é o raio, em metros, da busca por imóveis candidatos.
+	GroupingRadiusMeters int
+	// GroupingMaxCandidates é o número máximo de imóveis enviados ao modelo em
+	// cada comparação.
+	GroupingMaxCandidates int
 }
 
 // ErrMissingRequired indica que uma ou mais variáveis obrigatórias não foram
@@ -137,6 +162,21 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	groupingThreshold, err := parseUnitInterval(envGroupingConfidenceThreshold, DefaultGroupingConfidenceThreshold)
+	if err != nil {
+		return nil, err
+	}
+
+	groupingRadius, err := parsePositiveInt(envGroupingRadiusMeters, DefaultGroupingRadiusMeters)
+	if err != nil {
+		return nil, err
+	}
+
+	groupingMaxCandidates, err := parsePositiveInt(envGroupingMaxCandidates, DefaultGroupingMaxCandidates)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		DatabaseURL:        databaseURL,
 		AnthropicAPIKey:    anthropicKey,
@@ -148,7 +188,53 @@ func Load() (*Config, error) {
 		GeocodingAPIKey:    geocodingAPIKey,
 		GeocodingRateLimit: time.Duration(geocodingRateLimitMS) * time.Millisecond,
 		AmenitiesFile:      lookup(envAmenitiesFile, DefaultAmenitiesFile),
+
+		GroupingConfidenceThreshold: groupingThreshold,
+		GroupingRadiusMeters:        groupingRadius,
+		GroupingMaxCandidates:       groupingMaxCandidates,
 	}, nil
+}
+
+// parseUnitInterval lê uma probabilidade em [0,1]. Valor fora da faixa é erro
+// de boot e não recorte silencioso para a borda: um threshold de 8.5 (vírgula
+// digitada no lugar do ponto) viraria "nunca agrupa", e a coleta inteira
+// produziria imóveis duplicados sem uma linha de log explicando por quê.
+func parseUnitInterval(envName string, fallback float64) (float64, error) {
+	raw := lookup(envName, "")
+	if raw == "" {
+		return fallback, nil
+	}
+
+	parsed, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be a number between 0 and 1, got %q: %w", envName, raw, err)
+	}
+	if math.IsNaN(parsed) || parsed < 0 || parsed > 1 {
+		return 0, fmt.Errorf("config: %s must be between 0 and 1, got %v", envName, parsed)
+	}
+
+	return parsed, nil
+}
+
+// parsePositiveInt lê um inteiro estritamente positivo. Ao contrário de
+// parseRateLimitMS, zero **não** é aceito: raio zero não encontra candidato
+// nenhum e zero candidatos desliga o agrupamento — os dois casos parecem
+// "funcionando" nos logs enquanto criam um imóvel canônico por anúncio.
+func parsePositiveInt(envName string, fallback int) (int, error) {
+	raw := lookup(envName, "")
+	if raw == "" {
+		return fallback, nil
+	}
+
+	parsed, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be a positive integer, got %q: %w", envName, raw, err)
+	}
+	if parsed <= 0 {
+		return 0, fmt.Errorf("config: %s must be greater than 0, got %d", envName, parsed)
+	}
+
+	return parsed, nil
 }
 
 // parseRateLimitMS lê um intervalo em milissegundos com as regras comuns a
