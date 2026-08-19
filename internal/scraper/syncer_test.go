@@ -19,11 +19,12 @@ import (
 // chamado. O *pgxpool.Pool nunca é usado — nenhum teste deste pacote toca no
 // PostgreSQL.
 type syncSpy struct {
-	upsertCalls [][]db.RawListing
-	deleteCalls []deleteCall
-	deleted     int64
-	upsertErr   error
-	deleteErr   error
+	upsertCalls       [][]db.RawListing
+	deleteCalls       []deleteCall
+	deleted           int64
+	deletedProperties int64
+	upsertErr         error
+	deleteErr         error
 }
 
 type deleteCall struct {
@@ -40,9 +41,9 @@ func (s *syncSpy) install(t *testing.T) {
 		s.upsertCalls = append(s.upsertCalls, listings)
 		return s.upsertErr
 	}
-	deleteStaleListings = func(_ context.Context, _ *pgxpool.Pool, domain string, runStartedAt time.Time) (int64, error) {
+	deleteStaleListings = func(_ context.Context, _ *pgxpool.Pool, domain string, runStartedAt time.Time) (int64, int64, error) {
 		s.deleteCalls = append(s.deleteCalls, deleteCall{domain: domain, runStartedAt: runStartedAt})
-		return s.deleted, s.deleteErr
+		return s.deleted, s.deletedProperties, s.deleteErr
 	}
 	t.Cleanup(func() {
 		upsertListings, deleteStaleListings = previousUpsert, previousDelete
@@ -73,7 +74,7 @@ func TestSyncListingsUpsertsThenDeletesStale(t *testing.T) {
 		t.Fatalf("SyncListings() error = %v, want nil", err)
 	}
 
-	want := SyncStats{Upserted: 3, Deleted: 4}
+	want := SyncStats{Upserted: 3, Deleted: 4, PropertiesDeleted: 0}
 	if stats != want {
 		t.Errorf("SyncListings() = %+v, want %+v", stats, want)
 	}
@@ -94,7 +95,7 @@ func TestSyncListingsSkipsEverythingWhenNothingWasExtracted(t *testing.T) {
 	// Guarda mais importante do módulo: uma coleta que devolve zero anúncios por
 	// seletor quebrado não pode apagar o catálogo já acumulado.
 	for _, extracted := range [][]db.RawListing{nil, {}} {
-		spy := &syncSpy{deleted: 99}
+		spy := &syncSpy{deleted: 99, deletedProperties: 7}
 		spy.install(t)
 
 		stats, err := SyncListings(context.Background(), nil, "www.exemplo.com.br", extracted, time.Now())
@@ -203,6 +204,94 @@ func TestSyncListingsLogsSummary(t *testing.T) {
 	}
 	if entry.Domain != "www.exemplo.com.br" || entry.Upserted != 5 || entry.Deleted != 2 {
 		t.Errorf("log attrs = %+v, want domain/upserted/deleted preenchidos", entry)
+	}
+}
+
+// O número de imóveis canônicos removidos vem de db.DeleteStaleListings (que os
+// apaga na mesma transação do DELETE dos anúncios) e precisa chegar intacto ao
+// resumo do run.
+func TestSyncListingsReportsDeletedProperties(t *testing.T) {
+	spy := &syncSpy{deleted: 6, deletedProperties: 2}
+	spy.install(t)
+
+	stats, err := SyncListings(context.Background(), nil, "www.exemplo.com.br", sampleListings(3), time.Now())
+	if err != nil {
+		t.Fatalf("SyncListings() error = %v, want nil", err)
+	}
+
+	want := SyncStats{Upserted: 3, Deleted: 6, PropertiesDeleted: 2}
+	if stats != want {
+		t.Errorf("SyncListings() = %+v, want %+v", stats, want)
+	}
+}
+
+// Os dois logs contratuais não mudam; a linha das properties órfãs é separada e
+// só aparece quando alguma foi de fato removida.
+func TestSyncListingsLogsDeletedPropertiesOnASeparateLine(t *testing.T) {
+	tests := []struct {
+		name              string
+		deletedProperties int64
+		wantLines         int
+		wantMsg           string
+	}{
+		{
+			name:              "com órfãs removidas",
+			deletedProperties: 3,
+			wantLines:         2,
+			wantMsg:           "[www.exemplo.com.br] 3 imóveis canônicos removidos por terem ficado sem anúncios",
+		},
+		{name: "sem órfãs removidas", deletedProperties: 0, wantLines: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spy := &syncSpy{deleted: 4, deletedProperties: tt.deletedProperties}
+			spy.install(t)
+
+			var buf bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+
+			if _, err := SyncListings(context.Background(), nil, "www.exemplo.com.br", sampleListings(5), time.Now()); err != nil {
+				t.Fatalf("SyncListings() error = %v, want nil", err)
+			}
+
+			lines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
+			if len(lines) != tt.wantLines {
+				t.Fatalf("linhas de log = %d (%s), want %d", len(lines), buf.String(), tt.wantLines)
+			}
+
+			// A primeira linha continua sendo o resumo contratual, byte a byte.
+			var summary struct {
+				Msg string `json:"msg"`
+			}
+			if err := json.Unmarshal(lines[0], &summary); err != nil {
+				t.Fatalf("decoding log line %q: %v", lines[0], err)
+			}
+			if want := "[www.exemplo.com.br] sync concluído: 5 upserted, 4 deletados"; summary.Msg != want {
+				t.Errorf("log contratual = %q, want %q", summary.Msg, want)
+			}
+
+			if tt.wantLines == 1 {
+				return
+			}
+
+			var orphans struct {
+				Msg               string `json:"msg"`
+				Domain            string `json:"domain"`
+				PropertiesDeleted int64  `json:"properties_deleted"`
+			}
+			if err := json.Unmarshal(lines[1], &orphans); err != nil {
+				t.Fatalf("decoding log line %q: %v", lines[1], err)
+			}
+			if orphans.Msg != tt.wantMsg {
+				t.Errorf("log msg = %q, want %q", orphans.Msg, tt.wantMsg)
+			}
+			if orphans.Domain != "www.exemplo.com.br" || orphans.PropertiesDeleted != tt.deletedProperties {
+				t.Errorf("log attrs = %+v, want domain e properties_deleted preenchidos", orphans)
+			}
+		})
 	}
 }
 

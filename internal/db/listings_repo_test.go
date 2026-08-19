@@ -1,11 +1,13 @@
 package db
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestListingArgsOrderAndTrimming(t *testing.T) {
@@ -138,6 +140,100 @@ func TestNormalizeImageURLsNeverReturnsNil(t *testing.T) {
 	urls := []string{"a.jpg", "b.jpg"}
 	if got := normalizeImageURLs(urls); !reflect.DeepEqual(got, urls) {
 		t.Errorf("normalizeImageURLs(%v) = %v, want the same values", urls, got)
+	}
+}
+
+func TestStaleCountsByPropertyAggregatesWithMultiplicity(t *testing.T) {
+	// Um mesmo imóvel pode perder vários anúncios no mesmo run: o decremento tem
+	// que ser pelo número real, não por um.
+	ids := []*string{
+		ptr("prop-b"), ptr("prop-a"), nil, ptr("prop-b"),
+		ptr("prop-c"), nil, ptr("prop-b"),
+	}
+
+	got := staleCountsByProperty(ids)
+
+	want := []propertyDelta{
+		{propertyID: "prop-a", count: 1},
+		{propertyID: "prop-b", count: 3},
+		{propertyID: "prop-c", count: 1},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("staleCountsByProperty() = %+v, want %+v", got, want)
+	}
+}
+
+func TestStaleCountsByPropertyIgnoresListingsWithoutProperty(t *testing.T) {
+	// Anúncio nunca agrupado (property_id NULL) é apagado normalmente e não
+	// mexe em contador algum. Espaços em branco caem no mesmo caso.
+	for _, tt := range []struct {
+		name string
+		ids  []*string
+	}{
+		{name: "entrada vazia", ids: nil},
+		{name: "só NULL", ids: []*string{nil, nil}},
+		{name: "só espaços", ids: []*string{ptr("   ")}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := staleCountsByProperty(tt.ids)
+			if len(got) != 0 {
+				t.Errorf("staleCountsByProperty(%v) = %+v, want vazio", tt.ids, got)
+			}
+		})
+	}
+}
+
+func TestStaleCountsByPropertyIsDeterministicallyOrdered(t *testing.T) {
+	// A ordem fixa é a ordem de aquisição de locks: dois runs concorrentes que
+	// decrementassem o mesmo par de imóveis em ordens opostas se travariam.
+	ids := []*string{ptr("zzz"), ptr("aaa"), ptr("mmm"), ptr("aaa")}
+
+	for range 20 {
+		got := staleCountsByProperty(ids)
+		want := []string{"aaa", "mmm", "zzz"}
+		for i, id := range want {
+			if got[i].propertyID != id {
+				t.Fatalf("ordem = %+v, want %v", got, want)
+			}
+		}
+	}
+}
+
+func TestStaleCountsByPropertyTrimsIDs(t *testing.T) {
+	got := staleCountsByProperty([]*string{ptr("  prop-a  "), ptr("prop-a")})
+
+	want := []propertyDelta{{propertyID: "prop-a", count: 2}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("staleCountsByProperty() = %+v, want %+v", got, want)
+	}
+}
+
+func TestDeleteStaleListingsRejectsInvalidArguments(t *testing.T) {
+	// As guardas precisam retornar **antes** de abrir transação — com pool nil,
+	// qualquer ida ao banco seria um panic.
+	tests := []struct {
+		name         string
+		domain       string
+		runStartedAt time.Time
+		wantIn       string
+	}{
+		{name: "domínio vazio", domain: "  ", runStartedAt: time.Now(), wantIn: "domain is required"},
+		{name: "sem início de run", domain: "exemplo.com.br", wantIn: "runStartedAt is required"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deleted, properties, err := DeleteStaleListings(context.Background(), nil, tt.domain, tt.runStartedAt)
+			if err == nil {
+				t.Fatalf("DeleteStaleListings() error = nil, want erro mencionando %q", tt.wantIn)
+			}
+			if !strings.Contains(err.Error(), tt.wantIn) {
+				t.Errorf("DeleteStaleListings() error = %q, want it to mention %q", err, tt.wantIn)
+			}
+			if deleted != 0 || properties != 0 {
+				t.Errorf("contagens = (%d, %d), want (0, 0)", deleted, properties)
+			}
+		})
 	}
 }
 

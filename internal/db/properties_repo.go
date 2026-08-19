@@ -143,6 +143,28 @@ UPDATE properties
 SET active_listing_count = GREATEST(active_listing_count - 1, 0), updated_at = NOW()
 WHERE id = $1::uuid`
 
+// decrementListingCountBySQL é a versão em lote, usada pela limpeza de anúncios
+// sumidos (DeleteStaleListings): um mesmo imóvel pode perder vários anúncios no
+// mesmo run, e emitir um UPDATE por anúncio multiplicaria os round-trips sem
+// nenhum ganho. A aritmética continua dentro do UPDATE, pelo mesmo motivo da
+// versão unitária.
+const decrementListingCountBySQL = `
+UPDATE properties
+SET active_listing_count = GREATEST(active_listing_count - $2, 0), updated_at = NOW()
+WHERE id = $1::uuid`
+
+// deleteOrphanPropertiesSQL apaga, de uma vez, os imóveis que ficaram sem
+// nenhum anúncio. A guarda active_listing_count = 0 vive no próprio DELETE pelo
+// mesmo motivo de deletePropertySQL: um read-then-delete deixaria um vínculo
+// criado no meio virar anúncio órfão (a FK é ON DELETE SET NULL).
+//
+// Imóveis da lista que ainda têm anúncios simplesmente não casam com o WHERE —
+// não é erro, é o caso normal de um property que perdeu um anúncio e manteve
+// outros.
+const deleteOrphanPropertiesSQL = `
+DELETE FROM properties
+WHERE id = ANY($1::uuid[]) AND active_listing_count = 0`
+
 // selectPropertiesInBoundingBoxSQL é o **pré-filtro** da busca por raio: um
 // retângulo de lat/lng que o índice btree composto idx_properties_lat_lng
 // consegue usar. O recorte fino por distância real é feito em Go — o banco não
@@ -371,54 +393,60 @@ func LinkListingToProperty(ctx context.Context, pool *pgxpool.Pool, propertyID s
 // do imóvel — na mesma transação, pelo mesmo motivo de
 // LinkListingToProperty.
 //
+// Devolve o id do imóvel de que o anúncio acabou de ser desvinculado, ou string
+// vazia quando não havia vínculo algum (anúncio já solto ou inexistente). O id
+// vem do mesmo SELECT ... FOR UPDATE que a transação já faz: quem precisa
+// decidir se o imóvel ficou órfão (ver grouping.HandleListingRemoval) usaria um
+// SELECT extra, e entre ele e o desvínculo caberia outro vínculo.
+//
 // É idempotente nos dois sentidos: desvincular um anúncio que já estava solto é
 // no-op (nunca decrementa, então o contador não fica negativo), e anúncio
 // inexistente apenas loga um warning, seguindo o precedente de
 // MarkSelectorsBroken — desvincular é limpeza, e falhar nela travaria o
 // reprocessamento de uma deduplicação errada.
-func UnlinkListingFromProperty(ctx context.Context, pool *pgxpool.Pool, listingID int64) error {
+func UnlinkListingFromProperty(ctx context.Context, pool *pgxpool.Pool, listingID int64) (string, error) {
 	if listingID <= 0 {
-		return errors.New("db: unlink listing from property: listing id is required")
+		return "", errors.New("db: unlink listing from property: listing id is required")
 	}
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("db: unlink listing %d: begin transaction: %w", listingID, err)
+		return "", fmt.Errorf("db: unlink listing %d: begin transaction: %w", listingID, err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var currentPropertyID *string
 	err = tx.QueryRow(ctx, lockListingForUnlinkSQL, listingID).Scan(&currentPropertyID)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("db: unlink listing %d: %w", listingID, err)
+		return "", fmt.Errorf("db: unlink listing %d: %w", listingID, err)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("no listing row to unlink from property", "listing_id", listingID)
-		return nil
+		return "", nil
 	}
 
 	// Já solto: sair sem tocar no contador é justamente o que impede um
 	// desvínculo repetido de zerar (ou negativar) a contagem de um imóvel.
 	if currentPropertyID == nil {
 		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("db: unlink listing %d: commit: %w", listingID, err)
+			return "", fmt.Errorf("db: unlink listing %d: commit: %w", listingID, err)
 		}
-		return nil
+		return "", nil
 	}
 
 	if _, err := tx.Exec(ctx, clearListingPropertySQL, listingID); err != nil {
-		return fmt.Errorf("db: unlink listing %d: %w", listingID, err)
+		return "", fmt.Errorf("db: unlink listing %d: %w", listingID, err)
 	}
 
 	if _, err := tx.Exec(ctx, decrementListingCountSQL, *currentPropertyID); err != nil {
-		return fmt.Errorf("db: unlink listing %d: decrement property %q: %w", listingID, *currentPropertyID, err)
+		return "", fmt.Errorf("db: unlink listing %d: decrement property %q: %w", listingID, *currentPropertyID, err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("db: unlink listing %d: commit: %w", listingID, err)
+		return "", fmt.Errorf("db: unlink listing %d: commit: %w", listingID, err)
 	}
 
-	return nil
+	return *currentPropertyID, nil
 }
 
 // FindPropertiesByCoordinates devolve os imóveis geocodificados a até

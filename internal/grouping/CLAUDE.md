@@ -3,8 +3,10 @@
 ## Purpose
 Decide se um anúncio já normalizado e geocodificado se refere ao mesmo imóvel
 físico de algum registro canônico em `properties` — vinculando-o ao existente
-ou criando um novo. `PropertyGrouper.GroupListing` é a única porta de entrada e
-devolve `(propertyID string, isNew bool, err error)`.
+ou criando um novo. `PropertyGrouper.GroupListing` é a porta de entrada do
+agrupamento e devolve `(propertyID string, isNew bool, err error)`;
+`PropertyGrouper.HandleListingRemoval(ctx, listingID int64) (bool, error)` é a
+porta de saída, para desfazer um agrupamento errado.
 
 É o par de `internal/selectors` do lado do enriquecimento: orquestra
 `internal/ai` (a decisão) e `internal/db` (a persistência).
@@ -52,11 +54,24 @@ devolve `(propertyID string, isNew bool, err error)`.
 - `AreaSqm`, `City`, `State`, `TransactionType` e `PropertyType` nascem `nil`:
   `listings` não tem essas colunas e `AreaRaw` é texto livre que este pacote
   **não** parseia.
+- **`HandleListingRemoval` é o caminho *unitário*, não o da coleta.** Sequência:
+  `UnlinkListingFromProperty` → `GetActiveListingCount` → `DeleteProperty` se
+  zero. Anúncio sem vínculo (nunca agrupado ou inexistente) é **no-op sem erro**
+  — nem a contagem é feita. `db.ErrPropertyNotFound` na contagem e
+  `ErrPropertyHasListings`/`ErrPropertyNotFound` no delete são `slog.Warn` e
+  `false, nil`: nos três casos o estado final já é o desejado.
+- **A limpeza do fim de cada coleta não passa por aqui.** Quem apaga os anúncios
+  que sumiram do site é `db.DeleteStaleListings`, que já decrementa o contador e
+  remove os órfãos na mesma transação. Duplicar essa lógica neste pacote traria
+  de volta o contador dessincronizado.
 
 ## Dependencies
 `internal/ai` (`MatchProperty`, `MatchListing`, `PropertyMatch`), `internal/db`
-(`Property` e as três funções adaptadas em `store.go`) e `pgxpool` — este
-último só em `store.go`. Os parâmetros vêm de `internal/config`
+(`Property`, as sentinelas `ErrPropertyNotFound`/`ErrPropertyHasListings` e as
+seis funções adaptadas em `store.go`: `FindPropertiesByCoordinates`,
+`CreateProperty`, `LinkListingToProperty`, `UnlinkListingFromProperty`,
+`GetActiveListingCount`, `DeleteProperty`) e `pgxpool` — este último só em
+`store.go`. Os parâmetros vêm de `internal/config`
 (`GroupingConfidenceThreshold`, `GroupingRadiusMeters`, `GroupingMaxCandidates`).
 
 **Ainda não tem chamador.** Como os enrichers de `internal/enrichment`, o
@@ -71,12 +86,18 @@ anúncios pendentes e o wiring em `cmd/scraper` são a task de follow-up
   `active_listing_count = 0` e é removível por `db.DeleteProperty` — o id vai no
   erro e no `slog.Error` justamente para isso. Não há compensação transacional
   entre pacotes, de propósito.
+- **`HandleListingRemoval` também não é uma transação única**: cada função de
+  `db` abre a sua, mesmo precedente de `createAndLink`. Isso é seguro porque a
+  guarda `active_listing_count = 0` vive dentro do próprio `DELETE` — um anúncio
+  vinculado entre a contagem e a remoção só faz o imóvel não ser apagado. A
+  limpeza em lote (`db.DeleteStaleListings`) **é** atômica; não confunda as duas.
 - **A v1 não distingue venda de aluguel.** `listings` não tem esse dado; o mesmo
   imóvel anunciado para venda e para locação vira um único canônico. Quando a
   coluna existir, ela precisa entrar no prompt e em `propertyFrom`.
 - **Falso positivo é caro de desfazer** (dois imóveis distintos viram um).
   O default 0,85 e os `slog.Debug` de prompt/resposta em `internal/ai` existem
-  para calibrar; a correção é `db.UnlinkListingFromProperty` + `DeleteProperty`.
+  para calibrar; a correção é `HandleListingRemoval` (que já encadeia unlink →
+  contagem → delete), não chamar as funções de `db` na mão.
 - Os testes usam fakes: o comportamento real do SQL (`Find`/`Create`/`Link`)
   contra um PostgreSQL de verdade fica para o QA, como já registrado em
   `internal/db/CLAUDE.md`.

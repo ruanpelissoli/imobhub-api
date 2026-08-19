@@ -44,6 +44,11 @@ type SyncStats struct {
 	// Deleted é quantos anúncios do domínio deixaram de existir no site e foram
 	// removidos.
 	Deleted int64
+	// PropertiesDeleted é quantos imóveis canônicos ficaram sem nenhum anúncio
+	// depois dessa remoção e foram apagados junto, na mesma transação (ver
+	// db.DeleteStaleListings). Não é uma contagem por domínio: um imóvel pode
+	// agrupar anúncios de várias fontes, e só some quando o último cai.
+	PropertiesDeleted int64
 }
 
 // SyncListings reconcilia os anúncios extraídos de um domínio com o que está
@@ -97,12 +102,16 @@ func SyncListings(ctx context.Context, pool *pgxpool.Pool, domain string, extrac
 		return SyncStats{}, fmt.Errorf("scraper: syncing listings of %q: %w", domain, err)
 	}
 
-	deleted, err := deleteStaleListings(ctx, pool, domain, runStartedAt)
+	deleted, propertiesDeleted, err := deleteStaleListings(ctx, pool, domain, runStartedAt)
 	if err != nil {
 		return SyncStats{}, fmt.Errorf("scraper: syncing listings of %q: %w", domain, err)
 	}
 
-	stats := SyncStats{Upserted: int64(len(extracted)), Deleted: deleted}
+	stats := SyncStats{
+		Upserted:          int64(len(extracted)),
+		Deleted:           deleted,
+		PropertiesDeleted: propertiesDeleted,
+	}
 
 	// Mensagem em formato humano por decisão de produto (é o resumo que o
 	// operador procura ao acompanhar uma coleta); os atributos estruturados
@@ -112,6 +121,16 @@ func SyncListings(ctx context.Context, pool *pgxpool.Pool, domain string, extrac
 		"upserted", stats.Upserted,
 		"deleted", stats.Deleted,
 	)
+
+	// Linha separada, e só quando houve remoção: o resumo acima é contratual
+	// (tem teste e é o que o operador procura), e a remoção de imóveis canônicos
+	// é rara o bastante para poluir todo run se fosse incondicional.
+	if stats.PropertiesDeleted > 0 {
+		slog.InfoContext(ctx, fmt.Sprintf("[%s] %d imóveis canônicos removidos por terem ficado sem anúncios", domain, stats.PropertiesDeleted),
+			"domain", domain,
+			"properties_deleted", stats.PropertiesDeleted,
+		)
+	}
 
 	return stats, nil
 }

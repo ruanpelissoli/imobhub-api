@@ -110,25 +110,47 @@ compartilhado com `ai`, `selectors` e `scraper` — nenhum outro pacote monta SQ
   domínio, com o `runStartedAt` lido **antes** do primeiro upsert. Depois de uma
   coleta interrompida no meio, ela apaga o resto do catálogo; com "agora" no
   lugar do início do run, apaga tudo.
+- **`DeleteStaleListings` fecha o ciclo de vida do vínculo, numa transação só.**
+  Os três passos — `DELETE ... RETURNING property_id`, decremento do contador de
+  cada imóvel afetado (pela quantidade real de anúncios que perdeu) e
+  `DELETE FROM properties WHERE id = ANY(...) AND active_listing_count = 0` —
+  são atômicos. Separá-los era o bug que a task IMO-22 fechou: o hard delete sem
+  decremento deixava `active_listing_count` inflado para sempre, e o imóvel
+  virava órfão **e indeletável** (a guarda de `DeleteProperty` exige zero, e ele
+  nunca mais chegava lá). `property_id` NULL (anúncio nunca agrupado) é o caso
+  normal e é apenas ignorado na agregação.
+- **Os decrementos saem em ordem de id** (`staleCountsByProperty` ordena). Não é
+  cosmético: dois runs concorrentes que travassem o mesmo par de imóveis em
+  ordens opostas se bloqueariam mutuamente. Ordem fixa é ordem de aquisição de
+  locks — a função é pura e é ela que os testes deste pacote cobrem.
 - **`properties.active_listing_count` é denormalizado, e este pacote é quem o
-  mantém.** `LinkListingToProperty`/`UnlinkListingFromProperty` alteram
-  `listings.property_id` e o contador **na mesma transação** — os dois separados
-  produziriam uma inconsistência que nenhuma leitura posterior detecta. A
-  transação começa com `SELECT ... FROM listings ... FOR UPDATE`: sem esse lock,
-  dois links concorrentes do mesmo anúncio leriam ambos `property_id` NULL e
-  contariam duas vezes. A aritmética (`count + 1`, `GREATEST(count - 1, 0)`)
-  acontece dentro do `UPDATE`, nunca em Go.
+  mantém** — por `LinkListingToProperty`/`UnlinkListingFromProperty` (caminho
+  unitário) e por `DeleteStaleListings` (caminho em lote, o único que roda em
+  toda coleta). Todos alteram `listings.property_id` e o contador **na mesma
+  transação** — os dois separados produziriam uma inconsistência que nenhuma
+  leitura posterior detecta. O caminho unitário começa com
+  `SELECT ... FROM listings ... FOR UPDATE`: sem esse lock, dois links
+  concorrentes do mesmo anúncio leriam ambos `property_id` NULL e contariam duas
+  vezes. A aritmética (`count + 1`, `GREATEST(count - N, 0)`) acontece dentro do
+  `UPDATE`, nunca em Go.
+- **`UnlinkListingFromProperty` devolve o id do imóvel de que o anúncio saiu**
+  (string vazia = não havia vínculo, inclusive anúncio inexistente). O valor sai
+  do mesmo `FOR UPDATE` que a transação já faz: quem precisa decidir se o imóvel
+  ficou órfão (`grouping.HandleListingRemoval`) faria um `SELECT` extra, e entre
+  ele e o desvínculo caberia outro vínculo.
 - **Ambas as operações são idempotentes.** Religar o anúncio ao mesmo imóvel não
   incrementa de novo (a comparação é feita pelo PostgreSQL, tipo `uuid`, para
   não errar em UUID maiúsculo/sem hífens); religar a **outro** imóvel decrementa
   o antigo e incrementa o novo na mesma transação; desvincular um anúncio já
   solto é no-op — é isso que impede o contador de ficar negativo.
-- **`DeleteProperty` tem a guarda no próprio `DELETE`**
-  (`WHERE id = $1 AND active_listing_count = 0`), não num `SELECT` anterior: um
-  read-then-delete deixaria um vínculo criado no meio virar anúncio órfão
-  (a FK é `ON DELETE SET NULL`). Quando nada é apagado, uma segunda query
-  distingue `ErrPropertyNotFound` de `ErrPropertyHasListings` — aí já não há
-  corrida a perder, o resultado é só a mensagem.
+- **A guarda `active_listing_count = 0` vive sempre dentro do `DELETE`** — tanto
+  em `DeleteProperty` (unitário) quanto em `deleteOrphanPropertiesSQL` (lote).
+  Um read-then-delete deixaria um vínculo criado no meio virar anúncio órfão (a
+  FK é `ON DELETE SET NULL`). No caminho unitário, quando nada é apagado, uma
+  segunda query distingue `ErrPropertyNotFound` de `ErrPropertyHasListings` — aí
+  já não há corrida a perder, o resultado é só a mensagem. No lote, um imóvel da
+  lista que ainda tem anúncios simplesmente não casa com o `WHERE`, e isso é o
+  caso normal, não erro.
 - `ErrPropertyNotFound`, `ErrPropertyHasListings` e `ErrListingNotFound` são
   comparáveis com `errors.Is`: quem corrige uma deduplicação errada reage a
   `ErrPropertyHasListings` desvinculando os anúncios, sem inspecionar texto.
@@ -139,8 +161,12 @@ compartilhado com `ai`, `selectors` e `scraper` — nenhum outro pacote monta SQ
 - **`CreateProperty`/`UpdateProperty` ignoram `ActiveListingCount`** (e o Update
   não toca em `created_at`): deixar o caller gravar o contador dessincronizaria
   a contagem sem aviso. Hoje toda linha em `listings` é "ativa" (as sumidas são
-  apagadas por `DeleteStaleListings`), então incrementar no vínculo é correto —
-  **se `listings` ganhar coluna de status, esta regra precisa ser revista.**
+  apagadas por `DeleteStaleListings`, que decrementa o contador junto), então
+  incrementar no vínculo é correto — **se `listings` ganhar coluna de status,
+  esta regra e a limpeza em lote precisam ser revistas.**
+- **Bases que rodaram antes de IMO-22 continuam com o contador inflado.** O
+  backfill/reconciliação de `active_listing_count` é task à parte, de propósito:
+  a correção acima só impede novas divergências.
 - `(source_domain, listing_url)` e `domain` são as identidades usadas nos
   `ON CONFLICT`; ambos precisam chegar já **normalizados** (host sem esquema e
   sem barra final). Este pacote só faz `TrimSpace` — normalizar host é
@@ -156,10 +182,11 @@ compartilhado com `ai`, `selectors` e `scraper` — nenhum outro pacote monta SQ
   como query params (`pool_max_conns`).
 
 - Os testes deste pacote **não tocam no banco**: cobrem só as funções puras
-  (montagem de argumentos, validação, JSON, bounding box/haversine). O
-  comportamento do SQL — upsert, `ON CONFLICT`, contagem do DELETE,
-  idempotência do vínculo, `GREATEST` no contador, guarda do
-  `DeleteProperty` — depende de um PostgreSQL real e fica para o QA / testes de
+  (montagem de argumentos, validação, JSON, bounding box/haversine, agregação de
+  `staleCountsByProperty`). O comportamento do SQL — upsert, `ON CONFLICT`,
+  contagem do DELETE, `RETURNING`, `ANY($1::uuid[])`, idempotência do vínculo,
+  `GREATEST` no contador, guarda do `DeleteProperty` e a atomicidade da limpeza
+  em lote — depende de um PostgreSQL real e fica para o QA / testes de
   integração. Não há testcontainers nem banco in-memory aqui, de propósito.
 - `MarkSelectorsBroken` com domínio inexistente **não** é erro; apenas loga um
   warning. Na prática esse warning significa host não normalizado no chamador.
