@@ -51,6 +51,14 @@ tabelas são o contrato que todas as queries `pgx` assumem.
 - `properties.active_listing_count` é **denormalizado**: quem altera
   `listings.property_id` é responsável por mantê-lo coerente. Existe para a
   listagem não fazer um `COUNT` em `listings` a cada consulta.
+- Índices de busca de `properties` (migration `007`): o composto
+  `idx_properties_search_filters (transaction_type, property_type, city,
+  neighborhood)` para os filtros combinados; o composto
+  `idx_properties_attributes (bedroom_count, bathroom_count, parking_spots,
+  area_sqm)` para os filtros numéricos; o GIN `idx_properties_amenities`
+  (`amenities TEXT[]`, opclass default `array_ops`, atende `@>` e `&&`); e
+  `idx_properties_created_at (created_at DESC)` para a ordenação por mais
+  recentes.
 - Colunas de enriquecimento em `listings` (`normalized_neighborhood`,
   `bedroom_count`, `amenities`, `lat`, `lng`, `property_id`, `enriched_at`) são
   derivadas dos campos `_raw` — que continuam intocados, para permitir
@@ -108,6 +116,27 @@ tabelas são o contrato que todas as queries `pgx` assumem.
   do `006`, `Index Only Scan using idx_listings_enrichment_queue` (0,08 ms). A
   diferença não é constante: o `005` custa proporcional ao **total** de anúncios,
   o `006` ao número de **pendentes**.
+- **Os btrees compostos do `007` só servem com a coluna líder no filtro**:
+  `transaction_type` em `idx_properties_search_filters` e `bedroom_count` em
+  `idx_properties_attributes`. Uma busca que torne a coluna líder opcional (ou
+  que reordene as colunas do índice) volta a fazer sequential scan **em
+  silêncio**.
+- **Os índices do `007` ainda não têm leitor.** Não existe query nem endpoint de
+  busca no repositório; eles antecipam a implementação. Quando ela chegar,
+  revalide cada um com `EXPLAIN (ANALYZE, BUFFERS)` contra o WHERE real — é
+  exatamente o passo que faltou no `005` e que custou um índice mantido em toda
+  escrita e nunca usado. O risco é aceitável aqui porque `properties` só é
+  escrita no enriquecimento, não em toda coleta como `listings`.
+- **Não há índice de preço, e isso é decisão, não esquecimento.** `properties`
+  não tem coluna de preço; o único dado é `listings.price_raw TEXT`, texto bruto
+  ("R$ 450.000", "450 mil"), sobre o qual nenhum índice de faixa é possível. O
+  índice de preço nasce junto da migration que criar a coluna normalizada
+  (tipo numérico, moeda, venda x aluguel x condomínio e backfill são decisões
+  daquela task).
+- O GIN de `amenities` **não indexa arrays NULL** — como a convenção é ler NULL e
+  `'{}'` da mesma forma, isso é esperado e não bug. `created_at DESC` também é
+  redundante num btree de coluna única (percorrido nos dois sentidos): está ali
+  para explicitar a intenção, e não deve ganhar um gêmeo ASC.
 - Comparação de `timestamptz` é `IMMUTABLE`, então ela é aceita num predicado de
   índice parcial. O que **não** seria aceito é `now()` ou um cast dependente de
   fuso — se o predicado da fila algum dia virar "enriquecido nos últimos N dias",
