@@ -38,3 +38,15 @@ func (s *poolStore) CreateProperty(ctx context.Context, property db.Property) (d
 func (s *poolStore) LinkListingToProperty(ctx context.Context, propertyID string, listingID int64) error {
 	return db.LinkListingToProperty(ctx, s.pool, propertyID, listingID)
 }
+
+func (s *poolStore) GetPropertyByID(ctx context.Context, propertyID string) (*db.Property, error) {
+	return db.GetPropertyByID(ctx, s.pool, propertyID)
+}
+
+func (s *poolStore) ListListingsByPropertyID(ctx context.Context, propertyID string) ([]db.Listing, error) {
+	return db.ListListingsByPropertyID(ctx, s.pool, propertyID)
+}
+
+func (s *poolStore) UpdateProperty(ctx context.Context, property db.Property) error {
+	return db.UpdateProperty(ctx, s.pool, property)
+}

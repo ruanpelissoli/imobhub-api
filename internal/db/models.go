@@ -89,6 +89,34 @@ type RawListing struct {
 	ExtraData map[string]any
 }
 
+// Listing é uma linha de listings na forma que a consolidação do imóvel
+// canônico consome: só as colunas que entram no merge, mais o que identifica o
+// anúncio nos logs.
+//
+// É separado de RawListing de propósito. RawListing é o modelo de **escrita** da
+// coleta (identidade `(SourceDomain, ListingURL)`, sem `id`, com `ExtraData`);
+// este é o modelo de **leitura** do enriquecimento, e precisa do `id` — é ele
+// que dá a ordem determinística de que o merge depende. Fundir os dois obrigaria
+// a coleta a carregar campos que ela não preenche.
+type Listing struct {
+	// ID é listings.id, a chave da ordenação estável usada pelo merge.
+	ID int64
+	// SourceDomain e ListingURL identificam o anúncio na origem; entram apenas
+	// nos logs e nas mensagens de erro.
+	SourceDomain string
+	ListingURL   string
+	// DescriptionRaw é o texto cru do anúncio. NULL na coluna chega aqui como
+	// "", mesma convenção dos campos "_raw" de RawListing.
+	DescriptionRaw string
+	// BedroomCount é o valor já enriquecido. nil quando o anúncio não informa —
+	// 0 significaria "sem quarto".
+	BedroomCount *int
+	// Amenities e ImageURLs vêm de colunas TEXT[] nullable; na leitura NULL e
+	// vazio são a mesma coisa (ver normalizeTextArray).
+	Amenities []string
+	ImageURLs []string
+}
+
 // Property é o registro canônico de um imóvel: a versão consolidada e já
 // normalizada do que vários anúncios (RawListing) dizem sobre o mesmo imóvel
 // físico. A relação é 1:N — cada linha de listings aponta para no máximo uma
