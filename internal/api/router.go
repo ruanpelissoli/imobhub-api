@@ -61,13 +61,25 @@ func NewRouter(deps Deps) http.Handler {
 // registerV1Routes é o ponto de extensão do grupo /api/v1. As rotas de negócio
 // entram aqui, com o padrão do ServeMux 1.22+ ("GET "+apiV1Prefix+"/properties"),
 // para que nenhuma delas precise repetir a montagem dos middlewares.
+//
+// O padrão terminado em "/{$}" existe só para o id vazio: "/properties/" não
+// casa com "{id}" (o wildcard exige um segmento não-vazio) e cairia no 404
+// genérico do mux, quando o correto é 400 — o cliente mandou um id, ele é que
+// está em branco. "{$}" casa exclusivamente com esse path, sem capturar
+// "/properties/a/b".
+//
+// O padrão exato "/properties" (a busca) tem precedência sobre esses dois, então
+// ele encerra o 301 que o mux emitia de "/properties" para "/properties/".
 func registerV1Routes(mux *http.ServeMux, deps Deps) {
 	search := func(ctx context.Context, params db.PropertySearchParams) ([]db.Property, int64, error) {
 		return db.SearchProperties(ctx, deps.Pool, params)
 	}
-
 	mux.Handle("GET "+apiV1Prefix+"/properties",
 		handleSearchProperties(search, newPropertyCache(deps.Redis), deps.logger()))
+
+	getProperty := handleGetProperty(deps)
+	mux.HandleFunc("GET "+apiV1Prefix+"/properties/{id}", getProperty)
+	mux.HandleFunc("GET "+apiV1Prefix+"/properties/{$}", getProperty)
 }
 
 // handleHealth é liveness, não readiness: responde 200 sem tocar em Postgres ou

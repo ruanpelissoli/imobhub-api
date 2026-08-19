@@ -118,16 +118,21 @@ comodidades do `TermExtractor` chega por parâmetro de construtor (de
   `MergePropertyData` os relê do banco. Uma **única instância** de geocoder,
   extrator, normalizador e agrupador é compartilhada por todos os workers — o
   geocoder carrega o `DomainLimiter` de 1 req/s do Nominatim.
-- `api/` é o servidor HTTP: roteador com o grupo `/api/v1` (o ponto de extensão
-  é `registerV1Routes` — registrar fora dele ignora a cadeia de middlewares),
-  `/health` de liveness fora do grupo, middlewares de recovery/logging/CORS e a
-  conversão dos 404/405 do `ServeMux` para o envelope `{"error":"..."}`. Esse
-  envelope é convenção do projeto para toda resposta de erro. A primeira rota de
-  negócio é `GET /api/v1/properties` (busca paginada de `db.SearchProperties`
-  com DTO próprio em snake_case e cache Redis de 5 min). O acesso a dados e ao
-  Redis entra por seams declarados **no próprio `api`** (`propertySearcher`,
-  `cacheStore`), como `grouping` faz — é o que mantém os testes do pacote sem
-  Postgres e sem Redis.
+- `api/` é o servidor HTTP: roteador com o grupo `/api/v1`, `/health` de
+  liveness fora do grupo, middlewares de recovery/logging/CORS e a conversão dos
+  404/405 do `ServeMux` para o envelope `{"error":"..."}`. Esse envelope é
+  convenção do projeto para toda resposta de erro. Duas rotas de negócio:
+  `GET /api/v1/properties/{id}` (`properties_handler.go`) devolve o imóvel
+  canônico + anúncios vinculados, **sem Redis** e em duas queries fixas
+  (`db.GetPropertyWithListings`); `GET /api/v1/properties`
+  (`properties_search_handler.go`) é a busca paginada sobre
+  `db.SearchProperties`, com cache Redis de 5 min cujo erro degrada para o banco.
+  O ponto de extensão continua sendo `registerV1Routes` (registrar fora dele
+  ignora a cadeia de middlewares), e o DTO do imóvel (`propertyResponse`) é **um
+  só** — as rotas seguintes reusam, não recriam. O acesso a dados e ao Redis da
+  busca entra por seams declarados **no próprio `api`** (`propertySearcher`,
+  `cacheStore`), como `grouping` faz — é o que mantém os testes dela sem Postgres
+  e sem Redis.
 - Logs operacionais usam `log/slog` (handler JSON configurado em `main`). Não
   usar `fmt.Println`/`log.Printf`: quebra o parsing dos logs em produção.
 - Erros são embrulhados com `fmt.Errorf("pacote: ... %w", err)` e sempre citam o

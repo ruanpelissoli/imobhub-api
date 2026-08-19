@@ -82,6 +82,28 @@ compartilhado com `ai`, `selectors` e `scraper` — nenhum outro pacote monta SQ
   quebrar nenhum teste deste pacote. O `WHERE property_id = $1::uuid` é atendido
   pelo índice `idx_listings_property_id` (criado em `migrations/004`). Imóvel sem
   anúncios devolve slice vazia, nunca `nil` nem erro.
+- **`GetPropertyWithListings` são exatamente duas queries, sempre.** Uma para o
+  imóvel (`GetPropertyByID`) e uma para os anúncios — nunca uma por anúncio, e
+  **nunca um JOIN**: o JOIN repetiria os `TEXT[]` de `amenities`/`photos` em
+  cada linha e obrigaria a desduplicar em Go. Id inexistente segue devolvendo
+  `(nil, nil)` (o handler traduz para 404); imóvel sem anúncios devolve
+  `Listings` como slice vazia, nunca `nil`, e **não** é ausência.
+- **`PropertyListing` é modelo de leitura novo, não uma extensão de `Listing`**
+  — mesma regra de `PendingListing`. `Listing` está amarrado à ordem de colunas
+  de `selectListingsByPropertyIDSQL`, consumida pelo merge; a leitura do detalhe
+  precisa de `price_raw` e `last_seen_at`, que aquela query não seleciona.
+  `selectPropertyListingsSQL` é query própria, com `ORDER BY id` como contrato
+  (a tela reordenaria sozinha a cada refresh sem ele) e **sem filtro de status**,
+  porque status não existe: anúncio sumido é hard-deleted por
+  `DeleteStaleListings`, não marcado com `removed_at`.
+- **`ErrInvalidPropertyID` é a tradução do SQLSTATE `22P02`**
+  (`invalid_text_representation`), reconhecido por `isInvalidTextRepresentation`
+  via `pgconn.PgError`. Existe para que a API responda `400` em vez de `500` sem
+  validar formato de UUID em Go — o PostgreSQL aceita formas que uma regex
+  rejeitaria (sem hífens, entre chaves). **A tradução vive só em
+  `GetPropertyWithListings`**: as demais funções mantêm o contrato atual, porque
+  `grouping`/`enrichqueue` já lidam com os erros delas e nunca recebem id vindo
+  de query string. Id em branco sai antes de qualquer ida ao banco.
 - **A fila de enriquecimento vive em três funções**, consumidas por
   `internal/enrichqueue`: `ListPendingListings` (predicado
   `enriched_at IS NULL OR updated_at > enriched_at`, `ORDER BY id`, `LIMIT` e

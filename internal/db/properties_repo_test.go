@@ -1,6 +1,8 @@
 package db
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -8,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Os testes deste arquivo, como os do resto do pacote, **não tocam no banco**:
@@ -680,5 +684,72 @@ func TestSearchPropertiesSQLContract(t *testing.T) {
 	// Os placeholders de LIMIT/OFFSET vêm depois dos do WHERE, sem colidir.
 	if got, want := fmt.Sprintf("LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2), "LIMIT $3 OFFSET $4"; got != want {
 		t.Errorf("paginação numerada como %q, want %q", got, want)
+	}
+}
+
+func TestGetPropertyWithListingsRejectsBlankID(t *testing.T) {
+	// pool nil é parte da asserção: se a função tentasse consultar o banco com
+	// um id em branco, o teste entraria em pânico em vez de passar.
+	for _, id := range []string{"", "   ", "\t\n"} {
+		_, err := GetPropertyWithListings(context.Background(), nil, id)
+		if !errors.Is(err, ErrInvalidPropertyID) {
+			t.Errorf("GetPropertyWithListings(%q) = %v, want ErrInvalidPropertyID", id, err)
+		}
+	}
+}
+
+func TestIsInvalidTextRepresentation(t *testing.T) {
+	invalid := &pgconn.PgError{Code: pgInvalidTextRepresentation, Message: `invalid input syntax for type uuid: "abc"`}
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "erro nulo", err: nil, want: false},
+		{name: "22P02 direto", err: invalid, want: true},
+		{name: "22P02 embrulhado", err: fmt.Errorf("db: get property %q: %w", "abc", invalid), want: true},
+		{name: "outro SQLSTATE", err: &pgconn.PgError{Code: "23503"}, want: false},
+		{name: "erro comum", err: errors.New("boom"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isInvalidTextRepresentation(tt.err); got != tt.want {
+				t.Errorf("isInvalidTextRepresentation(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPropertyListingsSQLContract(t *testing.T) {
+	// A ordem das colunas é o que scanPropertyListing consome; trocá-la produz
+	// um scan silenciosamente errado.
+	if !strings.Contains(selectPropertyListingsSQL, "SELECT id, source_domain, listing_url, price_raw, last_seen_at") {
+		t.Errorf("selectPropertyListingsSQL = %q, want the column order consumed by scanPropertyListing", selectPropertyListingsSQL)
+	}
+
+	// ORDER BY id é contrato: sem ele a tela de comparação reordena os anúncios
+	// a cada refresh.
+	if !strings.HasSuffix(strings.TrimSpace(selectPropertyListingsSQL), "ORDER BY id") {
+		t.Errorf("selectPropertyListingsSQL = %q, want it to end with ORDER BY id", selectPropertyListingsSQL)
+	}
+
+	// O cast explícito segue o padrão do arquivo e é o que transforma id
+	// malformado em 22P02 (traduzido para ErrInvalidPropertyID).
+	if !strings.Contains(selectPropertyListingsSQL, "property_id = $1::uuid") {
+		t.Errorf("selectPropertyListingsSQL = %q, want WHERE property_id = $1::uuid", selectPropertyListingsSQL)
+	}
+
+	// Não existe status/removed_at em listings: filtrar por isso seria um WHERE
+	// sobre coluna inexistente.
+	if strings.Contains(selectPropertyListingsSQL, "removed_at") {
+		t.Errorf("selectPropertyListingsSQL = %q, want no removed_at filter (the column does not exist)", selectPropertyListingsSQL)
+	}
+
+	// Não é o SQL do merge: as colunas são outras e ampliar aquele quebraria
+	// scanListing.
+	if selectPropertyListingsSQL == selectListingsByPropertyIDSQL {
+		t.Error("selectPropertyListingsSQL não pode ser o mesmo SQL do merge")
 	}
 }
