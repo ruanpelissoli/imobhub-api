@@ -179,6 +179,167 @@ WHERE lat IS NOT NULL AND lng IS NOT NULL
   AND lat BETWEEN $1 AND $2
   AND lng BETWEEN $3 AND $4`
 
+// countPropertiesSQL e selectPropertiesPageSQL são os prefixos fixos da busca
+// paginada; o WHERE dinâmico (buildPropertySearchQuery) é concatenado nos dois,
+// **a mesma string**, para que contagem e página não possam filtrar diferente.
+const countPropertiesSQL = `
+SELECT COUNT(*)
+FROM properties`
+
+const selectPropertiesPageSQL = `
+SELECT` + propertyColumns + `
+FROM properties`
+
+// searchPropertiesOrderBy desempata por id de propósito: created_at não é
+// único e, sem o desempate, duas páginas consecutivas de um LIMIT/OFFSET podem
+// repetir ou pular um imóvel.
+const searchPropertiesOrderBy = `
+ORDER BY created_at DESC, id DESC`
+
+// defaultPropertyPageSize e maxPropertyPageSize limitam a página. O teto protege
+// tanto o banco quanto o custo do OFFSET, que cresce com a profundidade da
+// paginação.
+const (
+	defaultPropertyPageSize = 20
+	maxPropertyPageSize     = 50
+)
+
+// SearchProperties devolve uma página de imóveis canônicos filtrada por params,
+// mais o total de linhas que atendem ao filtro (para a UI montar a paginação).
+//
+// O total vem de uma query COUNT(*) **separada**, e não de um COUNT(*) OVER():
+// uma página além do fim não devolve linha alguma, e a window function faria o
+// total virar 0 em vez do valor real — a UI perderia a paginação exatamente
+// quando precisa dela para voltar.
+//
+// Página além do fim é caso normal: slice vazia com o total correto, sem erro.
+// Params totalmente zerado também é válido — devolve a primeira página do
+// catálogo inteiro, dos mais recentes para os mais antigos.
+//
+// **NULL não passa em filtro numérico**: `bedroom_count IS NULL` não satisfaz
+// `>= 1`, então imóveis ainda não consolidados desaparecem assim que um filtro
+// de atributo é usado. É o comportamento correto (não dá para afirmar que
+// atendem), mas é a explicação de "o imóvel sumiu da busca". `amenities` NULL
+// tampouco casa com `@>`.
+func SearchProperties(ctx context.Context, pool *pgxpool.Pool, params PropertySearchParams) ([]Property, int64, error) {
+	where, args := buildPropertySearchQuery(params)
+	limit, offset := normalizePropertyPagination(params.Page, params.PageSize)
+
+	var total int64
+	if err := pool.QueryRow(ctx, countPropertiesSQL+where, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("db: search properties: count: %w", err)
+	}
+
+	pageArgs := append(append(make([]any, 0, len(args)+2), args...), limit, offset)
+	pageSQL := fmt.Sprintf("%s%s%s\nLIMIT $%d OFFSET $%d",
+		selectPropertiesPageSQL, where, searchPropertiesOrderBy, len(args)+1, len(args)+2)
+
+	rows, err := pool.Query(ctx, pageSQL, pageArgs...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("db: search properties: page: %w", err)
+	}
+	defer rows.Close()
+
+	results := make([]Property, 0, limit)
+	for rows.Next() {
+		property, err := scanProperty(rows)
+		if err != nil {
+			return nil, 0, fmt.Errorf("db: search properties: page: %w", err)
+		}
+		results = append(results, property)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("db: search properties: page: %w", err)
+	}
+
+	return results, total, nil
+}
+
+// buildPropertySearchQuery monta o WHERE dinâmico da busca. É pura e separada da
+// execução: é o que permite testar a numeração dos placeholders e a ausência de
+// interpolação sem um PostgreSQL por perto.
+//
+// Devolve "" quando nenhum filtro está preenchido. O número de cada placeholder
+// é sempre len(args)+1, de modo que numeração e slice de argumentos não podem
+// divergir. **Nenhum valor do usuário entra na string** — só nomes de coluna,
+// que são literais deste arquivo.
+//
+// A ordem das cláusulas segue as colunas líderes dos índices de migrations/007
+// (transaction_type primeiro, bedroom_count antes dos demais numéricos). É
+// cosmética para o planner, mas mantém o SQL gerado legível ao lado do EXPLAIN.
+func buildPropertySearchQuery(params PropertySearchParams) (string, []any) {
+	conditions := make([]string, 0, 9)
+	args := make([]any, 0, 9)
+
+	addText := func(column, value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		args = append(args, value)
+		conditions = append(conditions, fmt.Sprintf("%s = $%d", column, len(args)))
+	}
+
+	addText("transaction_type", params.TransactionType)
+	addText("property_type", params.PropertyType)
+	addText("city", params.City)
+	addText("neighborhood", params.Neighborhood)
+
+	addMin := func(column string, value any, apply bool) {
+		if !apply {
+			return
+		}
+		args = append(args, value)
+		conditions = append(conditions, fmt.Sprintf("%s >= $%d", column, len(args)))
+	}
+
+	addMin("bedroom_count", params.MinBedrooms, params.MinBedrooms > 0)
+	addMin("bathroom_count", params.MinBathrooms, params.MinBathrooms > 0)
+	addMin("parking_spots", params.MinParkingSpots, params.MinParkingSpots > 0)
+	addMin("area_sqm", params.MinArea, params.MinArea > 0)
+
+	if amenities := trimmedNonEmpty(params.Amenities); len(amenities) > 0 {
+		args = append(args, amenities)
+		conditions = append(conditions, fmt.Sprintf("amenities @> $%d::text[]", len(args)))
+	}
+
+	if len(conditions) == 0 {
+		return "", args
+	}
+
+	return "\nWHERE " + strings.Join(conditions, "\n  AND "), args
+}
+
+// normalizePropertyPagination converte Page/PageSize em LIMIT/OFFSET. Normaliza
+// em vez de rejeitar: os valores vêm de uma query string, e devolver a primeira
+// página é uma resposta mais útil que um erro de validação para `?page=0`.
+func normalizePropertyPagination(page, pageSize int) (limit, offset int) {
+	if page <= 0 {
+		page = 1
+	}
+	switch {
+	case pageSize <= 0:
+		pageSize = defaultPropertyPageSize
+	case pageSize > maxPropertyPageSize:
+		pageSize = maxPropertyPageSize
+	}
+
+	return pageSize, (page - 1) * pageSize
+}
+
+// trimmedNonEmpty limpa a lista de comodidades antes de ela virar argumento: um
+// item em branco na query string viraria um elemento do TEXT[] que nenhum imóvel
+// contém, zerando o resultado sem explicação.
+func trimmedNonEmpty(values []string) []string {
+	cleaned := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			cleaned = append(cleaned, value)
+		}
+	}
+	return cleaned
+}
+
 // CreateProperty insere um novo imóvel canônico e devolve a cópia com id,
 // created_at e updated_at preenchidos pelo banco.
 //

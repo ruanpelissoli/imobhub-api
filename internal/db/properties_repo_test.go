@@ -1,8 +1,11 @@
 package db
 
 import (
+	"fmt"
 	"math"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -335,5 +338,300 @@ func TestFilterWithinRadiusReturnsEmptyNotNil(t *testing.T) {
 		t.Fatal("filterWithinRadius(nil) = nil, want empty slice")
 	} else if len(got) != 0 {
 		t.Errorf("filterWithinRadius(nil) = %v, want empty slice", got)
+	}
+}
+
+func TestBuildPropertySearchQueryWithoutFiltersProducesNoWhereClause(t *testing.T) {
+	// Params zerado é um pedido válido: a primeira página do catálogo inteiro.
+	where, args := buildPropertySearchQuery(PropertySearchParams{})
+
+	if where != "" {
+		t.Errorf("buildPropertySearchQuery(zero) where = %q, want empty", where)
+	}
+	if len(args) != 0 {
+		t.Errorf("buildPropertySearchQuery(zero) args = %v, want none", args)
+	}
+}
+
+func TestBuildPropertySearchQueryAppliesOnlyFilledFilters(t *testing.T) {
+	tests := []struct {
+		name       string
+		params     PropertySearchParams
+		wantClause string
+		wantArg    any
+	}{
+		{
+			name:       "transaction_type",
+			params:     PropertySearchParams{TransactionType: "venda"},
+			wantClause: "transaction_type = $1",
+			wantArg:    "venda",
+		},
+		{
+			name:       "property_type",
+			params:     PropertySearchParams{PropertyType: "apartamento"},
+			wantClause: "property_type = $1",
+			wantArg:    "apartamento",
+		},
+		{
+			name:       "city",
+			params:     PropertySearchParams{City: "Curitiba"},
+			wantClause: "city = $1",
+			wantArg:    "Curitiba",
+		},
+		{
+			name:       "neighborhood",
+			params:     PropertySearchParams{Neighborhood: "Batel"},
+			wantClause: "neighborhood = $1",
+			wantArg:    "Batel",
+		},
+		{
+			name:       "bedrooms",
+			params:     PropertySearchParams{MinBedrooms: 3},
+			wantClause: "bedroom_count >= $1",
+			wantArg:    3,
+		},
+		{
+			name:       "bathrooms",
+			params:     PropertySearchParams{MinBathrooms: 2},
+			wantClause: "bathroom_count >= $1",
+			wantArg:    2,
+		},
+		{
+			name:       "parking",
+			params:     PropertySearchParams{MinParkingSpots: 1},
+			wantClause: "parking_spots >= $1",
+			wantArg:    1,
+		},
+		{
+			name:       "area",
+			params:     PropertySearchParams{MinArea: 72.5},
+			wantClause: "area_sqm >= $1",
+			wantArg:    72.5,
+		},
+		{
+			name:       "amenities",
+			params:     PropertySearchParams{Amenities: []string{"piscina", "elevador"}},
+			wantClause: "amenities @> $1::text[]",
+			wantArg:    []string{"piscina", "elevador"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			where, args := buildPropertySearchQuery(tt.params)
+
+			if got, want := where, "\nWHERE "+tt.wantClause; got != want {
+				t.Errorf("where = %q, want %q", got, want)
+			}
+			if len(args) != 1 {
+				t.Fatalf("args = %v, want exactly one", args)
+			}
+			if !reflect.DeepEqual(args[0], tt.wantArg) {
+				t.Errorf("args[0] = %#v, want %#v", args[0], tt.wantArg)
+			}
+		})
+	}
+}
+
+func TestBuildPropertySearchQueryIgnoresZeroValues(t *testing.T) {
+	// Zero-value é "filtro não aplicado", nunca "filtre por zero": um
+	// `bedroom_count >= 0` deixaria de fora justamente os imóveis com NULL.
+	params := PropertySearchParams{
+		TransactionType: "",
+		City:            "   ",
+		MinBedrooms:     0,
+		MinBathrooms:    -1,
+		MinArea:         0,
+		Amenities:       []string{},
+		Page:            3,
+		PageSize:        10,
+	}
+
+	where, args := buildPropertySearchQuery(params)
+
+	if where != "" {
+		t.Errorf("where = %q, want empty", where)
+	}
+	if len(args) != 0 {
+		t.Errorf("args = %v, want none", args)
+	}
+}
+
+func TestBuildPropertySearchQueryClauseOrderAndPlaceholderNumbering(t *testing.T) {
+	params := PropertySearchParams{
+		TransactionType: "venda",
+		PropertyType:    "apartamento",
+		City:            "Curitiba",
+		Neighborhood:    "Batel",
+		MinBedrooms:     3,
+		MinBathrooms:    2,
+		MinParkingSpots: 1,
+		MinArea:         72.5,
+		Amenities:       []string{"piscina"},
+	}
+
+	where, args := buildPropertySearchQuery(params)
+
+	wantWhere := "\nWHERE transaction_type = $1" +
+		"\n  AND property_type = $2" +
+		"\n  AND city = $3" +
+		"\n  AND neighborhood = $4" +
+		"\n  AND bedroom_count >= $5" +
+		"\n  AND bathroom_count >= $6" +
+		"\n  AND parking_spots >= $7" +
+		"\n  AND area_sqm >= $8" +
+		"\n  AND amenities @> $9::text[]"
+
+	if where != wantWhere {
+		t.Errorf("where =\n%q\nwant\n%q", where, wantWhere)
+	}
+
+	// A numeração precisa ser 1..len(args), sem buracos e sem repetição: um
+	// placeholder a mais (ou a menos) que o slice é erro de protocolo do pgx,
+	// não um resultado errado — e só apareceria em runtime.
+	placeholders := regexp.MustCompile(`\$(\d+)`).FindAllStringSubmatch(where, -1)
+	if len(placeholders) != len(args) {
+		t.Fatalf("where tem %d placeholders, want %d (len(args))", len(placeholders), len(args))
+	}
+	for i, match := range placeholders {
+		number, err := strconv.Atoi(match[1])
+		if err != nil {
+			t.Fatalf("placeholder %q não é numérico: %v", match[0], err)
+		}
+		if number != i+1 {
+			t.Errorf("placeholder %d = $%d, want $%d", i, number, i+1)
+		}
+	}
+
+	wantArgs := []any{"venda", "apartamento", "Curitiba", "Batel", 3, 2, 1, 72.5, []string{"piscina"}}
+	if !reflect.DeepEqual(args, wantArgs) {
+		t.Errorf("args = %#v, want %#v", args, wantArgs)
+	}
+}
+
+func TestBuildPropertySearchQueryNeverInterpolatesUserValues(t *testing.T) {
+	const injection = `Curitiba'; DROP TABLE properties;--`
+
+	params := PropertySearchParams{
+		TransactionType: injection,
+		PropertyType:    `"aspas"`,
+		City:            injection,
+		Neighborhood:    `a' OR '1'='1`,
+		Amenities:       []string{`piscina'); DELETE FROM properties;--`},
+	}
+
+	where, args := buildPropertySearchQuery(params)
+
+	for _, forbidden := range []string{"DROP", "DELETE", "Curitiba", "aspas", "'", `"`, ";", "--"} {
+		if strings.Contains(where, forbidden) {
+			t.Errorf("where = %q contém %q; nenhum valor do usuário pode entrar na string SQL", where, forbidden)
+		}
+	}
+
+	// O valor precisa estar presente — inteiro e sem escapes — mas só nos args.
+	if len(args) != 5 {
+		t.Fatalf("args = %v, want 5", args)
+	}
+	if args[0] != injection {
+		t.Errorf("args[0] = %#v, want %#v", args[0], injection)
+	}
+}
+
+func TestBuildPropertySearchQueryTrimsTextFilters(t *testing.T) {
+	where, args := buildPropertySearchQuery(PropertySearchParams{
+		TransactionType: "  venda  ",
+		City:            "\t \n",
+	})
+
+	if got, want := where, "\nWHERE transaction_type = $1"; got != want {
+		t.Errorf("where = %q, want %q (city só com espaços não vira cláusula)", got, want)
+	}
+	if len(args) != 1 || args[0] != "venda" {
+		t.Errorf("args = %#v, want [\"venda\"]", args)
+	}
+}
+
+func TestBuildPropertySearchQueryIgnoresEmptyAmenities(t *testing.T) {
+	for _, amenities := range [][]string{nil, {}, {"", "   "}} {
+		where, args := buildPropertySearchQuery(PropertySearchParams{Amenities: amenities})
+		if where != "" {
+			t.Errorf("buildPropertySearchQuery(Amenities=%#v) where = %q, want empty", amenities, where)
+		}
+		if len(args) != 0 {
+			t.Errorf("buildPropertySearchQuery(Amenities=%#v) args = %v, want none", amenities, args)
+		}
+	}
+
+	// Itens em branco no meio da lista são descartados, não viram elemento do
+	// TEXT[] — um `@>` com "" nunca casaria e zeraria a busca sem explicação.
+	_, args := buildPropertySearchQuery(PropertySearchParams{Amenities: []string{" piscina ", "  ", "elevador"}})
+	if got, want := args, []any{[]string{"piscina", "elevador"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("args = %#v, want %#v", got, want)
+	}
+}
+
+func TestNormalizePropertyPagination(t *testing.T) {
+	tests := []struct {
+		name       string
+		page       int
+		pageSize   int
+		wantLimit  int
+		wantOffset int
+	}{
+		{name: "tudo zerado usa a primeira página e o default", page: 0, pageSize: 0, wantLimit: 20, wantOffset: 0},
+		{name: "negativos são normalizados", page: -3, pageSize: -1, wantLimit: 20, wantOffset: 0},
+		{name: "acima do teto é cortado em 50", page: 1, pageSize: 51, wantLimit: 50, wantOffset: 0},
+		{name: "o teto exato passa", page: 2, pageSize: 50, wantLimit: 50, wantOffset: 50},
+		{name: "offset é (page-1) * pageSize", page: 3, pageSize: 20, wantLimit: 20, wantOffset: 40},
+		{name: "página além do fim continua sendo um offset válido", page: 1000, pageSize: 20, wantLimit: 20, wantOffset: 19980},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			limit, offset := normalizePropertyPagination(tt.page, tt.pageSize)
+			if limit != tt.wantLimit {
+				t.Errorf("limit = %d, want %d", limit, tt.wantLimit)
+			}
+			if offset != tt.wantOffset {
+				t.Errorf("offset = %d, want %d", offset, tt.wantOffset)
+			}
+		})
+	}
+}
+
+func TestSearchPropertiesSQLContract(t *testing.T) {
+	// O desempate por id é invariante, não estética: created_at não é único e,
+	// sem ele, duas páginas consecutivas podem repetir ou pular um imóvel.
+	if got, want := strings.TrimSpace(searchPropertiesOrderBy), "ORDER BY created_at DESC, id DESC"; got != want {
+		t.Errorf("searchPropertiesOrderBy = %q, want %q", got, want)
+	}
+
+	// O total vem de um COUNT(*) separado. Com COUNT(*) OVER(), uma página além
+	// do fim não devolve linha alguma e o total viria 0 em vez do valor real.
+	if strings.Contains(countPropertiesSQL, "OVER") {
+		t.Errorf("countPropertiesSQL = %q, want a plain COUNT(*) without a window function", countPropertiesSQL)
+	}
+	if !strings.Contains(countPropertiesSQL, "COUNT(*)") {
+		t.Errorf("countPropertiesSQL = %q, want it to use COUNT(*)", countPropertiesSQL)
+	}
+	if strings.Contains(selectPropertiesPageSQL, "OVER") {
+		t.Errorf("selectPropertiesPageSQL = %q, want no window function", selectPropertiesPageSQL)
+	}
+
+	// A página lê exatamente as colunas que scanProperty consome.
+	if !strings.Contains(selectPropertiesPageSQL, propertyColumns) {
+		t.Error("selectPropertiesPageSQL não usa propertyColumns; o scan sairia da ordem")
+	}
+
+	// Os dois prefixos aceitam o mesmo WHERE concatenado, o que é o que garante
+	// que contagem e página filtrem igual.
+	where, args := buildPropertySearchQuery(PropertySearchParams{TransactionType: "venda", MinBedrooms: 2})
+	if !strings.HasSuffix(countPropertiesSQL+where, where) || !strings.HasSuffix(selectPropertiesPageSQL+where, where) {
+		t.Error("o WHERE dinâmico precisa ser concatenável aos dois prefixos sem alteração")
+	}
+
+	// Os placeholders de LIMIT/OFFSET vêm depois dos do WHERE, sem colidir.
+	if got, want := fmt.Sprintf("LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2), "LIMIT $3 OFFSET $4"; got != want {
+		t.Errorf("paginação numerada como %q, want %q", got, want)
 	}
 }

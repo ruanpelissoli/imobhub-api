@@ -136,6 +136,29 @@ compartilhado com `ai`, `selectors` e `scraper` — nenhum outro pacote monta SQ
   retângulo é calculado pela borda mais próxima do polo, com 0,1% de margem:
   sobrar é de graça, faltar perde imóvel. PostGIS não está na stack — busca
   geoespacial "de verdade" é outra task.
+- **`SearchProperties` separa a montagem do WHERE da execução.**
+  `buildPropertySearchQuery` é pura e devolve `(where, args)`; é ela que os
+  testes cobrem (numeração dos `$N`, ordem das cláusulas, ausência de
+  interpolação). A **mesma** string de WHERE é concatenada ao `COUNT(*)` e ao
+  SELECT da página — é o que garante, por construção, que total e resultados
+  filtrem igual. O número de cada placeholder é sempre `len(args)+1`, então
+  numeração e slice não podem divergir; `LIMIT`/`OFFSET` ocupam os dois últimos.
+- **O total vem de uma query `COUNT(*)` separada, nunca de `COUNT(*) OVER()`.**
+  Uma página além do fim não devolve linha alguma, e a window function faria o
+  total virar 0 em vez do valor real — a UI perderia a paginação exatamente
+  quando precisa dela para voltar. Duas queries é o preço.
+- **`ORDER BY created_at DESC, id DESC` — o desempate por `id` é invariante.**
+  `created_at` não é único; sem o desempate, duas páginas consecutivas de um
+  `LIMIT/OFFSET` podem repetir ou pular um imóvel.
+- **`Page`/`PageSize` são normalizados, não validados** (`Page <= 0` → 1,
+  `PageSize <= 0` → 20, `> 50` → 50). Os valores vêm de query string: devolver a
+  primeira página é mais útil que um erro para `?page=0`. O teto de 50 também
+  limita o quanto o `OFFSET` pode custar.
+- **`PropertySearchParams` usa valores, não ponteiros** — o oposto de
+  `Property`. Ali `nil` é "não consolidado"; aqui zero-value é "filtro não
+  aplicado", e "filtrar por exatamente zero quartos" não é um pedido possível
+  (os filtros numéricos são pisos `>=`). Slice vazia/nil de `Amenities` e string
+  vazia após `TrimSpace` também não geram cláusula.
 
 ## Business logic / invariantes
 - `RunMigrations` é idempotente e roda **antes** do pipeline em `main`.
@@ -209,6 +232,16 @@ compartilhado com `ai`, `selectors` e `scraper` — nenhum outro pacote monta SQ
 - **Bases que rodaram antes de IMO-22 continuam com o contador inflado.** O
   backfill/reconciliação de `active_listing_count` é task à parte, de propósito:
   a correção acima só impede novas divergências.
+- **`SearchProperties` exclui em silêncio o que tem NULL na coluna filtrada.**
+  `bedroom_count IS NULL` não satisfaz `>= 1`, e `amenities` NULL não casa com
+  `@>`: imóveis ainda não consolidados desaparecem assim que um filtro de
+  atributo ou de comodidade é usado. É o comportamento correto (não dá para
+  afirmar que atendem), mas é **a** explicação de "o imóvel sumiu da busca".
+  Resultado vazio é slice vazia, nunca `nil` (mesma convenção de
+  `filterWithinRadius`); página além do fim é caso normal, não erro.
+- **`Amenities` é contenção (`@>`), ou seja, AND**: o imóvel precisa ter
+  **todas** as comodidades pedidas. Para "qualquer uma" o operador seria `&&`
+  (o mesmo GIN atende os dois), mas isso é decisão de produto, não default.
 - `(source_domain, listing_url)` e `domain` são as identidades usadas nos
   `ON CONFLICT`; ambos precisam chegar já **normalizados** (host sem esquema e
   sem barra final). Este pacote só faz `TrimSpace` — normalizar host é
@@ -218,6 +251,25 @@ compartilhado com `ai`, `selectors` e `scraper` — nenhum outro pacote monta SQ
 - **Nunca inclua a `DATABASE_URL` numa mensagem de erro** — ela contém a senha e
   vazaria para os logs. Por isso o erro de `Ping` cita apenas `Host` e
   `Database` extraídos do config parseado, e o erro de parsing não ecoa a URL.
+- **A busca sem `transaction_type` (ou sem `MinBedrooms`) cai em sequential scan
+  em silêncio.** Os btrees compostos de `migrations/007` só são usados com a
+  coluna líder no filtro. `SearchProperties` **não** torna nenhum filtro
+  obrigatório de propósito — buscar o catálogo inteiro é um caso válido —, mas
+  quem for otimizar a busca precisa saber que essa é a origem do custo. A
+  revalidação com `EXPLAIN (ANALYZE, BUFFERS)` contra o WHERE real ainda não foi
+  feita (exige PostgreSQL com volume) e é do QA; o que não for usado vira
+  migration **nova**, nunca edição do `007`.
+- **`city`/`neighborhood` são case- e acento-sensitive** (`=`): "curitiba" não
+  acha "Curitiba". É proposital — `ILIKE`/`unaccent` inviabilizariam o btree, e
+  a normalização de bairro já acontece antes, no enriquecimento. Quem chamar a
+  busca precisa passar o valor já normalizado.
+- **Não há filtro de preço, e isso é decisão registrada** em
+  `migrations/CLAUDE.md`: `properties` não tem coluna de preço e
+  `listings.price_raw` é texto bruto. `MinPrice`/`MaxPrice` nascem junto da
+  migration que criar a coluna normalizada — não faça JOIN com `listings` para
+  parsear `price_raw`.
+- **`OFFSET` alto degrada**: o PostgreSQL varre e descarta as linhas puladas. O
+  teto de 50 por página limita o dano hoje; paginação por cursor é outra task.
 - Parâmetros de pool (`MaxConns`, `MinConns`, `MaxConnLifetime`) ainda estão nos
   defaults do pgx. Quando houver medição de carga real, configure-os em
   `cfg` antes do `NewWithConfig` — a `DATABASE_URL` também aceita alguns deles
@@ -225,12 +277,15 @@ compartilhado com `ai`, `selectors` e `scraper` — nenhum outro pacote monta SQ
 
 - Os testes deste pacote **não tocam no banco**: cobrem só as funções puras
   (montagem de argumentos, validação, JSON, bounding box/haversine, agregação de
-  `staleCountsByProperty`) e três **contratos em string** — que o SQL de
+  `staleCountsByProperty`, montagem do WHERE e da paginação da busca) e alguns
+  **contratos em string** — que o SQL de
   enriquecimento não menciona `updated_at`, que o upsert mantém a guarda
   `IS DISTINCT FROM` com `last_seen_at` incondicional, e que o predicado de
   `selectPendingListingsSQL` continua idêntico ao do índice parcial de
   `migrations/006` (divergir faz o índice deixar de ser usado em silêncio, e a
-  fila volta a varrer a tabela inteira). As três regras foram confirmadas contra
+  fila volta a varrer a tabela inteira), que o `ORDER BY` da busca mantém o
+  desempate por `id` e que a contagem não usa window function. As três primeiras
+  regras foram confirmadas contra
   um PostgreSQL 17 real: upsert do **mesmo** payload não bumpa `updated_at` e
   renova `last_seen_at`; upsert com `price_raw` alterado bumpa; e o `EXPLAIN` da
   fila usa `idx_listings_enrichment_queue`. Esses são os bugs
