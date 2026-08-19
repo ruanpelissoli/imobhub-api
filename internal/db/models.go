@@ -161,6 +161,42 @@ type PendingListing struct {
 	PropertyID *string
 }
 
+// PropertyListing é uma linha de listings na forma que a tela de comparação
+// entre portais consome: o que identifica a fonte, o preço como ela publicou e
+// quando o anúncio foi visto pela última vez.
+//
+// É um modelo **novo** pelo mesmo motivo de PendingListing: Listing é o modelo
+// de leitura do merge, amarrado à ordem de colunas de
+// selectListingsByPropertyIDSQL, e ampliá-lo obrigaria scanListing a preencher
+// colunas que aquela query não seleciona.
+type PropertyListing struct {
+	// ID é listings.id, também a chave da ordenação estável da resposta.
+	ID int64
+	// SourceDomain é o host normalizado do portal ("www.exemplo.com.br"). É a
+	// única identidade de fonte que existe no schema — não há nome comercial da
+	// imobiliária em lugar nenhum.
+	SourceDomain string
+	// ListingURL é a URL absoluta do anúncio na origem.
+	ListingURL string
+	// PriceRaw é o texto cru publicado pelo portal ("R$ 450.000", "450 mil").
+	// NULL na coluna chega aqui como "", mesma convenção dos campos "_raw".
+	// **Não é numérico**: a coluna normalizada nasce em outra migration.
+	PriceRaw string
+	// LastSeenAt é listings.last_seen_at (NOT NULL): a última coleta em que o
+	// anúncio ainda estava no site.
+	LastSeenAt time.Time
+}
+
+// PropertyDetail é o imóvel canônico com todos os anúncios que apontam para
+// ele. É o retorno de GetPropertyWithListings e existe para que o detalhe seja
+// lido em duas queries fixas, sem N+1 e sem repetir amenities/photos por linha.
+type PropertyDetail struct {
+	Property Property
+	// Listings é sempre não-nil (imóvel sem anúncios devolve slice vazia) e vem
+	// ordenado por id.
+	Listings []PropertyListing
+}
+
 // ListingEnrichment é o payload de escrita das colunas de enriquecimento de um
 // anúncio. Os campos opcionais são ponteiros pela mesma razão de Property: nil
 // vira NULL na coluna, e NULL é a forma honesta de dizer "não reconhecido".

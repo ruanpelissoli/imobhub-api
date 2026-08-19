@@ -116,11 +116,15 @@ comodidades do `TermExtractor` chega por parâmetro de construtor (de
   `MergePropertyData` os relê do banco. Uma **única instância** de geocoder,
   extrator, normalizador e agrupador é compartilhada por todos os workers — o
   geocoder carrega o `DomainLimiter` de 1 req/s do Nominatim.
-- `api/` é o esqueleto do servidor HTTP: roteador com o grupo `/api/v1`
-  (ainda **sem rotas de negócio** — o ponto de extensão é `registerV1Routes`),
-  `/health` de liveness fora do grupo, middlewares de recovery/logging/CORS e a
-  conversão dos 404/405 do `ServeMux` para o envelope `{"error":"..."}`. Esse
-  envelope é convenção do projeto para toda resposta de erro.
+- `api/` é o servidor HTTP: roteador com o grupo `/api/v1`, `/health` de
+  liveness fora do grupo, middlewares de recovery/logging/CORS e a conversão dos
+  404/405 do `ServeMux` para o envelope `{"error":"..."}`. Esse envelope é
+  convenção do projeto para toda resposta de erro. A primeira rota de negócio é
+  `GET /api/v1/properties/{id}` (`properties_handler.go`): imóvel canônico +
+  anúncios vinculados, **sem Redis** e em duas queries fixas
+  (`db.GetPropertyWithListings`). O ponto de extensão continua sendo
+  `registerV1Routes`, e o DTO do imóvel (`propertyResponse`) é **um só** — as
+  rotas seguintes reusam, não recriam.
 - Logs operacionais usam `log/slog` (handler JSON configurado em `main`). Não
   usar `fmt.Println`/`log.Printf`: quebra o parsing dos logs em produção.
 - Erros são embrulhados com `fmt.Errorf("pacote: ... %w", err)` e sempre citam o

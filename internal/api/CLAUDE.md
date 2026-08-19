@@ -48,6 +48,50 @@ Monta o servidor HTTP: roteador (`/api/v1` + `/health`), os middlewares base
   sinal — passá-lo abortaria o shutdown na hora, o oposto de deixar as
   requisições em voo terminarem.
 
+## Rotas de negócio (`properties_handler.go`)
+- **`GET /api/v1/properties/{id}` é a primeira rota de negócio**, e é a tela de
+  comparação entre portais: o imóvel canônico mais **todos** os anúncios
+  vinculados, cada um com seu preço e a URL de origem.
+- **`propertyResponse` é O DTO do imóvel.** Toda rota futura que devolver imóvel
+  (busca, listagem, geo) monta esse mesmo struct — dois mapeamentos JSON para a
+  mesma entidade divergiriam no primeiro campo novo. `newPropertyDetailResponse`
+  é pura de propósito: é ela que os testes cobrem sem banco.
+- **Nenhum acesso ao Redis neste endpoint**, nem leitura nem escrita, e é
+  decisão, não esquecimento: servir preço obsoleto numa tela cujo propósito é
+  comparar preços é o pior defeito possível dela. Duas queries por requisição é
+  o preço aceito.
+- **A resposta não tem `price`.** O schema não tem preço canônico em
+  `properties`; o único dado de preço é `listings.price_raw`, **texto bruto**
+  ("R$ 450.000", "450 mil"), exposto por anúncio e sem nenhum parsing aqui. A
+  coluna normalizada (e um `price` no imóvel) nasce em outra task.
+- **A fonte do anúncio é `source_domain`, não nome comercial.** Nome de fachada
+  da imobiliária não existe em lugar nenhum do schema.
+- **`active_listing_count` não é exposto.** O contador é denormalizado e pode
+  divergir de `len(listings)` em bases anteriores à IMO-22; publicar os dois
+  lado a lado colocaria uma contradição visível na tela. A verdade da resposta
+  são as linhas realmente lidas.
+- **Nullable vira `null`, array vazio vira `[]`.** Campos consolidados são
+  ponteiros no DTO (NULL ≠ `0`/`""` — a ausência é informação); `amenities`,
+  `photos` e `listings` passam por `emptyIfNil` e nunca saem como `null`. Imóvel
+  existente mas nunca consolidado é `200` com tudo `null`, não erro; imóvel sem
+  anúncios é `200` com `"listings": []`, não 404.
+- **Timestamps saem em RFC 3339 UTC** (`formatTimestamp`): sem a conversão, o
+  offset da timezone da conexão vazaria para o contrato.
+- **`{id}` e `{$}` são registrados juntos.** `/api/v1/properties/` não casa com
+  `{id}` (o wildcard exige segmento não-vazio) e cairia no 404 genérico do mux,
+  quando o correto é `400` — o cliente mandou um id, ele é que está em branco.
+  **Efeito colateral pinado em teste:** registrar o padrão de subtree faz o mux
+  responder `301` em `GET /api/v1/properties` (sem barra) enquanto a rota de
+  busca não existir. É transitório — quando o padrão exato entrar, ele ganha —,
+  mas navegadores cacheiam 301: quem for implementar a busca deve atualizar
+  `TestPropertiesWithoutTrailingSlashRedirects` junto.
+- **Id malformado é `400`, não `500`.** A validação não é feita em Go: o handler
+  reage a `db.ErrInvalidPropertyID`, que é a tradução do SQLSTATE `22P02` do
+  PostgreSQL (ver `internal/db/CLAUDE.md` para o porquê de não validar formato
+  de UUID aqui).
+- **`context.Canceled` (cliente desconectou) é logado em `Debug`**, não em
+  `Error`: não é falha da aplicação e não deve poluir o alerta de erro.
+
 ## Business logic / invariantes
 - **Envelope de erro do projeto: `{"error":"mensagem"}` com
   `Content-Type: application/json`.** Todo handler novo responde falhas assim,
@@ -68,6 +112,11 @@ por `cmd/api`.
 - **`registerV1Routes` é o ponto de extensão.** Rotas novas entram lá, com o
   padrão `"GET " + apiV1Prefix + "/properties"`. Registrar fora dela ignora a
   cadeia de middlewares.
+- **Os testes deste pacote não abrem conexão.** Só os caminhos que não tocam o
+  pool são exercitados de ponta a ponta (`400` de id em branco, `405`, `404` de
+  path aninhado, o redirect); `Deps.Pool` é `*pgxpool.Pool` concreto, sem
+  interface para fakear, então `200`/`404`/`500` reais ficam para o QA. O
+  mapeamento do DTO é coberto pela função pura.
 - **Não escreva no `ResponseWriter` antes de decidir o status.** Se o handler já
   começou a responder, o `recovery` não consegue trocar a resposta por 500 —
   ele mantém o que foi enviado (trocar produziria uma resposta corrompida).
