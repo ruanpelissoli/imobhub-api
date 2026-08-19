@@ -29,6 +29,20 @@ const upsertBatchSize = 100
 // ele que protege o anúncio do DELETE de anúncios sumidos no fim do run (ver
 // DeleteStaleListings). updated_at é setado à mão porque a tabela não tem
 // trigger (ver migrations/CLAUDE.md).
+//
+// **updated_at só é bumpado quando algum campo coletado mudou de fato.** Ele é
+// metade do predicado da fila de enriquecimento
+// (enriched_at IS NULL OR updated_at > enriched_at): um NOW() incondicional
+// devolveria à fila todo anúncio visto em toda coleta, e o catálogo inteiro
+// seria reprocessado — com chamada paga de IA por anúncio — todo dia, sem que
+// nada tivesse mudado. A comparação é campo a campo com IS DISTINCT FROM (e não
+// ROW(...) IS DISTINCT FROM ROW(...)) para ficar legível qual campo dispara o
+// bump e para não depender da sutileza de comparação de linha com jsonb/text[].
+//
+// last_seen_at, ao contrário, continua **incondicional**: ele não responde "o
+// anúncio mudou?", e sim "o anúncio ainda está no site". É ele que protege a
+// linha de DeleteStaleListings, e condicioná-lo apagaria todo anúncio que não
+// mudou desde a coleta anterior.
 const upsertListingSQL = `
 INSERT INTO listings (
 	source_domain, listing_url, title_raw, price_raw, address_raw,
@@ -46,7 +60,56 @@ ON CONFLICT (source_domain, listing_url) DO UPDATE SET
 	image_urls      = EXCLUDED.image_urls,
 	extra_data      = EXCLUDED.extra_data,
 	last_seen_at    = NOW(),
-	updated_at      = NOW()`
+	updated_at      = CASE WHEN
+		listings.title_raw       IS DISTINCT FROM EXCLUDED.title_raw
+		OR listings.price_raw       IS DISTINCT FROM EXCLUDED.price_raw
+		OR listings.address_raw     IS DISTINCT FROM EXCLUDED.address_raw
+		OR listings.description_raw IS DISTINCT FROM EXCLUDED.description_raw
+		OR listings.bedrooms_raw    IS DISTINCT FROM EXCLUDED.bedrooms_raw
+		OR listings.area_raw        IS DISTINCT FROM EXCLUDED.area_raw
+		OR listings.image_urls      IS DISTINCT FROM EXCLUDED.image_urls
+		OR listings.extra_data      IS DISTINCT FROM EXCLUDED.extra_data
+	THEN NOW() ELSE listings.updated_at END`
+
+// selectPendingListingsSQL lê um lote da fila de enriquecimento.
+//
+// O predicado tem dois ramos: enriched_at IS NULL (nunca enriquecido, o caso
+// dominante) e updated_at > enriched_at (o anúncio mudou no site depois do
+// último passe). O segundo só é confiável porque upsertListingSQL passou a
+// bumpar updated_at condicionalmente — ver o comentário de lá.
+//
+// A paginação é por keyset (id > $1), e não por OFFSET: um anúncio que falha
+// **não** recebe enriched_at e continua na fila, então o OFFSET faria o lote
+// seguinte devolver as mesmas linhas para sempre. Com o cursor, a drenagem
+// avança mesmo quando parte do lote falha.
+const selectPendingListingsSQL = `
+SELECT id, source_domain, listing_url, title_raw, description_raw, address_raw,
+       area_raw, bedrooms_raw, normalized_neighborhood, bedroom_count,
+       amenities, image_urls, lat, lng, property_id
+FROM listings
+WHERE (enriched_at IS NULL OR updated_at > enriched_at) AND id > $1
+ORDER BY id
+LIMIT $2`
+
+// updateListingEnrichmentSQL grava as colunas derivadas de um anúncio.
+//
+// **Não toca em updated_at, de propósito.** Ele é metade do predicado da fila:
+// setá-lo aqui deixaria updated_at > enriched_at verdadeiro logo após o carimbo,
+// e o anúncio voltaria à fila em todo run, para sempre. É a mesma razão pela
+// qual enriched_at é carimbado por uma função separada, depois do agrupamento.
+const updateListingEnrichmentSQL = `
+UPDATE listings SET
+	normalized_neighborhood = $2,
+	bedroom_count           = $3,
+	amenities               = $4,
+	lat                     = $5,
+	lng                     = $6
+WHERE id = $1`
+
+// markListingEnrichedSQL carimba o fim do enriquecimento do anúncio. Assim como
+// updateListingEnrichmentSQL, **não** toca em updated_at — ver o comentário de
+// lá.
+const markListingEnrichedSQL = `UPDATE listings SET enriched_at = NOW() WHERE id = $1`
 
 // deleteStaleListingsSQL remove os anúncios de um domínio que não apareceram na
 // coleta atual. O corte é o instante em que o run começou: tudo que foi visto
@@ -320,6 +383,155 @@ func ListListingsByPropertyID(ctx context.Context, pool *pgxpool.Pool, propertyI
 	}
 
 	return listings, nil
+}
+
+// ListPendingListings devolve um lote da fila de enriquecimento: os anúncios
+// nunca enriquecidos ou modificados desde o último passe, **ordenados por id**,
+// com id maior que afterID.
+//
+// afterID é o cursor da drenagem: 0 no primeiro lote, e o maior id do lote
+// anterior nos seguintes. Ele é obrigatório para que a fila avance mesmo quando
+// um anúncio falha — um anúncio que falha não recebe enriched_at e voltaria no
+// lote seguinte indefinidamente.
+//
+// Fila vazia devolve slice vazia (nunca nil) e erro nulo: é o caso normal de um
+// catálogo já enriquecido.
+func ListPendingListings(ctx context.Context, pool *pgxpool.Pool, afterID int64, limit int) ([]PendingListing, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("db: list pending listings: limit must be greater than 0, got %d", limit)
+	}
+
+	rows, err := pool.Query(ctx, selectPendingListingsSQL, afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("db: list pending listings after id %d: %w", afterID, err)
+	}
+	defer rows.Close()
+
+	listings := make([]PendingListing, 0, limit)
+	for rows.Next() {
+		listing, err := scanPendingListing(rows)
+		if err != nil {
+			return nil, fmt.Errorf("db: list pending listings after id %d: %w", afterID, err)
+		}
+		listings = append(listings, listing)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: list pending listings after id %d: %w", afterID, err)
+	}
+
+	return listings, nil
+}
+
+// UpdateListingEnrichment grava as colunas derivadas do anúncio
+// (normalized_neighborhood, bedroom_count, amenities, lat, lng).
+//
+// **Precisa rodar antes do merge do imóvel canônico**: grouping.MergePropertyData
+// relê bedroom_count/amenities/image_urls/description_raw do banco, então um
+// merge feito antes desta gravação consolidaria os valores antigos.
+//
+// Anúncio inexistente é no-op sem erro (mesma convenção de MarkSelectorsBroken):
+// a linha pode ter sido apagada por DeleteStaleListings entre a leitura da fila
+// e a gravação, e isso é ciclo de vida normal, não falha.
+func UpdateListingEnrichment(ctx context.Context, pool *pgxpool.Pool, enrichment ListingEnrichment) error {
+	if enrichment.ID <= 0 {
+		return fmt.Errorf("db: update listing enrichment: listing id is required, got %d", enrichment.ID)
+	}
+
+	_, err := pool.Exec(ctx, updateListingEnrichmentSQL, listingEnrichmentArgs(enrichment)...)
+	if err != nil {
+		return fmt.Errorf("db: update enrichment of listing %d: %w", enrichment.ID, err)
+	}
+
+	return nil
+}
+
+// MarkListingEnriched carimba enriched_at = NOW() no anúncio, tirando-o da fila.
+//
+// É uma função separada de UpdateListingEnrichment (e não um booleano nela) de
+// propósito: o carimbo é o **último** passo do fluxo, depois do agrupamento e da
+// consolidação do canônico, e um parâmetro permitiria carimbar cedo por engano —
+// o anúncio sairia da fila sem nunca ter sido agrupado.
+//
+// Anúncio inexistente é no-op sem erro, mesma razão de UpdateListingEnrichment.
+func MarkListingEnriched(ctx context.Context, pool *pgxpool.Pool, listingID int64) error {
+	if listingID <= 0 {
+		return fmt.Errorf("db: mark listing enriched: listing id is required, got %d", listingID)
+	}
+
+	if _, err := pool.Exec(ctx, markListingEnrichedSQL, listingID); err != nil {
+		return fmt.Errorf("db: mark listing %d as enriched: %w", listingID, err)
+	}
+
+	return nil
+}
+
+// listingEnrichmentArgs monta os argumentos de updateListingEnrichmentSQL na
+// ordem dos placeholders. Os ponteiros nil chegam ao banco como NULL — é
+// exatamente a distinção que o struct existe para preservar.
+func listingEnrichmentArgs(enrichment ListingEnrichment) []any {
+	return []any{
+		enrichment.ID,
+		enrichment.NormalizedNeighborhood,
+		enrichment.BedroomCount,
+		normalizeTextArray(enrichment.Amenities),
+		enrichment.Lat,
+		enrichment.Lng,
+	}
+}
+
+// scanPendingListing lê uma linha na ordem de selectPendingListingsSQL. Todas as
+// colunas de texto envolvidas são nullable e passam por *string temporário: pgx
+// não escaneia NULL para string, e aqui NULL e "" são a mesma coisa.
+func scanPendingListing(row pgx.Row) (PendingListing, error) {
+	var (
+		listing      PendingListing
+		title        *string
+		description  *string
+		address      *string
+		area         *string
+		bedrooms     *string
+		neighborhood *string
+	)
+	err := row.Scan(
+		&listing.ID,
+		&listing.SourceDomain,
+		&listing.ListingURL,
+		&title,
+		&description,
+		&address,
+		&area,
+		&bedrooms,
+		&neighborhood,
+		&listing.BedroomCount,
+		&listing.Amenities,
+		&listing.ImageURLs,
+		&listing.Lat,
+		&listing.Lng,
+		&listing.PropertyID,
+	)
+	if err != nil {
+		return PendingListing{}, err
+	}
+
+	listing.TitleRaw = derefText(title)
+	listing.DescriptionRaw = derefText(description)
+	listing.AddressRaw = derefText(address)
+	listing.AreaRaw = derefText(area)
+	listing.BedroomsRaw = derefText(bedrooms)
+	listing.NormalizedNeighborhood = derefText(neighborhood)
+	listing.Amenities = normalizeTextArray(listing.Amenities)
+	listing.ImageURLs = normalizeTextArray(listing.ImageURLs)
+
+	return listing, nil
+}
+
+// derefText converte uma coluna de texto nullable no "" que os campos "_raw"
+// usam para ausência.
+func derefText(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 // scanListing lê uma linha na ordem de selectListingsByPropertyIDSQL.

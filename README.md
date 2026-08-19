@@ -71,25 +71,42 @@ O mesmo `.env` serve para os dois modos de execução: os valores apontam para
 Com a infra do compose no ar (ou um Postgres próprio na `DATABASE_URL`):
 
 ```bash
-go run ./cmd/scraper
+go run ./cmd/scraper                 # coleta + enriquecimento (default)
+go run ./cmd/scraper -only=scrape    # só a coleta
+go run ./cmd/scraper -only=enrich    # só a fila de enriquecimento
 ```
 
-Uma execução aplica as migrations pendentes e coleta **todas** as fontes do
-`sources.txt`, uma de cada vez: robots.txt, rate limiting por domínio,
-seletores (reusados do banco ou descobertos via Claude), extração e
-sincronização com a tabela `listings`. Ao final, o resumo do run sai no log.
-Uma fonte que falha não interrompe as demais e **não** muda o exit code — o
-processo só sai com 1 em erro fatal (config, banco, arquivo de fontes ilegível).
+Uma execução aplica as migrations pendentes e roda duas etapas em sequência:
+
+1. **Coleta** — todas as fontes do `sources.txt`, uma de cada vez: robots.txt,
+   rate limiting por domínio, seletores (reusados do banco ou descobertos via
+   Claude), extração e sincronização com a tabela `listings`.
+2. **Enriquecimento** — os anúncios pendentes (`enriched_at` nulo ou anterior à
+   última alteração) passam por normalização de bairro, extração de quartos e
+   comodidades, geocodificação, agrupamento no imóvel canônico e consolidação de
+   `properties`. Roda num worker pool de `ENRICHMENT_WORKERS` (default 4) e só
+   começa se a coleta tiver terminado com sucesso.
+
+Ao final de cada etapa, o resumo sai no log. Uma fonte ou um anúncio que falha
+não interrompe os demais: fica registrado no resumo e é retomado no próximo run.
+O processo sai com 1 em erro fatal (config, banco, arquivo de fontes ilegível) —
+e também quando a fila de enriquecimento falha, **sem** que isso signifique
+perda da coleta, que já foi persistida.
+
+> O enriquecimento faz uma chamada **paga** à Anthropic por anúncio que chega com
+> coordenadas e algum imóvel já cadastrado por perto. As variáveis
+> `GROUPING_RADIUS_METERS` e `GROUPING_MAX_CANDIDATES` são o controle de custo.
 
 ## Testes
 
 ```bash
 go test ./...          # inclui o teste que sobe um Chrome headless de verdade
-go test -short ./...   # pula os testes que dependem de browser
+go test -short ./...   # pula browser e os testes que exigem PostgreSQL
 ```
 
 Testes que exigem browser são **pulados** (não falham) quando não há Chrome
-instalado.
+instalado. O teste de integração da fila de enriquecimento usa o Postgres do
+`docker-compose.yml` e é pulado quando `DATABASE_URL` não está definida.
 
 ## Estrutura
 

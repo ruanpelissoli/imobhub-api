@@ -81,4 +81,12 @@ tabelas são o contrato que todas as queries `pgx` assumem.
   latitude/longitude; busca por raio exigirá outro índice.
 - `listings.enriched_at IS NULL` = anúncio pendente de enriquecimento. É o
   filtro da fila; comparar com `updated_at` diz se o anúncio mudou desde o
-  último passe.
+  último passe. **Isso só funciona porque `upsertListingSQL` passou a bumpar
+  `updated_at` condicionalmente** (`IS DISTINCT FROM` campo a campo): com o
+  `NOW()` incondicional que existia antes, o catálogo inteiro voltava à fila
+  todo dia. Ver `internal/db/CLAUDE.md`.
+- `idx_listings_pending_enrichment` (`005`) é **parcial**, sobre
+  `(id) WHERE enriched_at IS NULL`. Ele cobre só o ramo "nunca enriquecido" — o
+  outro (`updated_at > enriched_at`) compara duas colunas da mesma linha e
+  nenhum btree o atende. Não tente "consertar" isso com um índice composto:
+  quem segura esse ramo é a guarda no upsert, não o índice.
