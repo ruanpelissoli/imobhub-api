@@ -48,6 +48,7 @@ const (
 	DefaultEnrichmentWorkers = 4
 
 	envDatabaseURL        = "DATABASE_URL"
+	envRedisURL           = "REDIS_URL"
 	envAnthropicAPIKey    = "ANTHROPIC_API_KEY"
 	envSourcesFile        = "SOURCES_FILE"
 	envScraperUserAgent   = "SCRAPER_USER_AGENT"
@@ -81,6 +82,10 @@ const (
 type Config struct {
 	// DatabaseURL é a connection string PostgreSQL (obrigatória).
 	DatabaseURL string
+	// RedisURL é a connection string do Redis, no formato aceito por
+	// redis.ParseURL (obrigatória). Não tem default: um localhost implícito
+	// apontaria para um Redis que não é o do ambiente, sem uma linha de aviso.
+	RedisURL string
 	// AnthropicAPIKey é a chave da API da Anthropic usada pelo pacote ai
 	// (obrigatória).
 	AnthropicAPIKey string
@@ -133,6 +138,11 @@ func Load() (*Config, error) {
 	databaseURL := lookup(envDatabaseURL, "")
 	if databaseURL == "" {
 		missing = append(missing, envDatabaseURL)
+	}
+
+	redisURL := lookup(envRedisURL, "")
+	if redisURL == "" {
+		missing = append(missing, envRedisURL)
 	}
 
 	anthropicKey := lookup(envAnthropicAPIKey, "")
@@ -195,6 +205,7 @@ func Load() (*Config, error) {
 
 	return &Config{
 		DatabaseURL:        databaseURL,
+		RedisURL:           redisURL,
 		AnthropicAPIKey:    anthropicKey,
 		SourcesFile:        lookup(envSourcesFile, DefaultSourcesFile),
 		ScraperUserAgent:   lookup(envScraperUserAgent, DefaultUserAgent),

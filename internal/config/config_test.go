@@ -12,6 +12,7 @@ import (
 func setRequired(t *testing.T) {
 	t.Helper()
 	t.Setenv(envDatabaseURL, "postgres://user:pass@localhost:5432/imobhub")
+	t.Setenv(envRedisURL, "redis://localhost:6379/0")
 	t.Setenv(envAnthropicAPIKey, "sk-ant-test")
 }
 
@@ -298,17 +299,47 @@ func TestLoadAcceptsZeroGeocodingRateLimit(t *testing.T) {
 	}
 }
 
+func TestLoadReadsRedisURL(t *testing.T) {
+	setRequired(t)
+	t.Setenv(envRedisURL, "  redis://cache.internal:6380/2  ") // espaços devem ser removidos
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+
+	if want := "redis://cache.internal:6380/2"; cfg.RedisURL != want {
+		t.Errorf("RedisURL = %q, want %q", cfg.RedisURL, want)
+	}
+}
+
+// REDIS_URL não tem default: o projeto rejeita fallback silencioso, e um
+// localhost:6379 implícito apontaria para um Redis que não é o do ambiente.
+func TestLoadRequiresRedisURL(t *testing.T) {
+	setRequired(t)
+	t.Setenv(envRedisURL, "")
+
+	_, err := Load()
+	if !errors.Is(err, ErrMissingRequired) {
+		t.Fatalf("Load() error = %v, want ErrMissingRequired", err)
+	}
+	if !strings.Contains(err.Error(), envRedisURL) {
+		t.Errorf("error %q does not mention %q", err, envRedisURL)
+	}
+}
+
 func TestLoadReportsAllMissingRequired(t *testing.T) {
 	t.Setenv(envDatabaseURL, "")
+	t.Setenv(envRedisURL, "")
 	t.Setenv(envAnthropicAPIKey, "")
 
 	_, err := Load()
 	if !errors.Is(err, ErrMissingRequired) {
 		t.Fatalf("Load() error = %v, want ErrMissingRequired", err)
 	}
-	// As duas faltantes devem aparecer para o operador corrigir de uma vez.
+	// As três faltantes devem aparecer para o operador corrigir de uma vez.
 	msg := err.Error()
-	for _, name := range []string{envDatabaseURL, envAnthropicAPIKey} {
+	for _, name := range []string{envDatabaseURL, envRedisURL, envAnthropicAPIKey} {
 		if !strings.Contains(msg, name) {
 			t.Errorf("error %q does not mention %q", msg, name)
 		}
