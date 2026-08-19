@@ -81,6 +81,12 @@ Nenhuma regra de negócio mora aqui — ela vive em `internal/`.
 - `go run ./cmd/scraper` executa a coleta completa: exige `DATABASE_URL`,
   `REDIS_URL`, `ANTHROPIC_API_KEY` e — para as fontes `headless` —
   Chrome/Chromium no PATH.
+- **O serviço do `docker-compose.yml` que roda este binário chama-se `scraper`**
+  (era `api` até a task do servidor HTTP). Hoje `api` é um serviço de vida longa
+  que roda `cmd/api`. Quem tinha `docker compose run --rm api` automatizado
+  esperando uma coleta precisa trocar para `docker compose run --rm scraper`.
+- **Este binário continua sendo o dono do schema.** `cmd/api` não aplica
+  migrations de propósito; um banco virgem só é migrado quando o scraper roda.
 - Como cada execução aplica migrations, subir o binário **altera o schema**. Não
   aponte um processo de versão antiga para um banco já migrado por uma versão
   nova esperando que ele reverta: não há `down`.

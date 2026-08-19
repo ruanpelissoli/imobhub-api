@@ -1,13 +1,16 @@
-# Stack local do ImobHub: PostgreSQL, Redis e a aplicação.
+# Stack local do ImobHub: PostgreSQL, Redis e os dois binários da aplicação.
 #
 # Uso:
-#   cp .env.example .env   # preencha ANTHROPIC_API_KEY
-#   docker compose up -d db redis   # sobe só a infra (rode a app com `go run`)
-#   docker compose run --rm api     # executa uma coleta completa no container
+#   cp .env.example .env             # preencha ANTHROPIC_API_KEY
+#   docker compose up -d db redis    # sobe só a infra (rode a app com `go run`)
+#   docker compose run --rm scraper  # executa uma coleta completa no container
+#   docker compose up -d api         # sobe o servidor HTTP em ${API_PORT:-8080}
 #
-# A app é um processo batch (uma execução = uma coleta de todas as fontes e
-# sai), por isso `restart: no` e o uso de `run`/`up api` em vez de um serviço
-# sempre ligado.
+# São dois processos com ciclos de vida diferentes:
+#   - `scraper` é batch (uma execução = uma coleta de todas as fontes e sai), por
+#     isso `restart: "no"` e o uso de `run` em vez de um serviço sempre ligado.
+#   - `api` é de vida longa e publica a porta no host, por isso
+#     `restart: unless-stopped`.
 
 services:
   db:
@@ -24,8 +27,10 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      # `api` espera este healthcheck: as migrations rodam no startup e falham
-      # se o Postgres ainda estiver inicializando.
+      # `scraper` espera este healthcheck: as migrations rodam no startup e
+      # falham se o Postgres ainda estiver inicializando. A `api` espera pelo
+      # mesmo motivo prático — ela não migra, mas valida a conexão com um Ping
+      # no boot e sairia com erro se subisse antes do banco.
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-imobhub} -d ${POSTGRES_DB:-imobhub}"]
       interval: 5s
       timeout: 3s
@@ -48,11 +53,11 @@ services:
       timeout: 3s
       retries: 10
 
-  api:
+  scraper:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: imobhub-api
+    container_name: imobhub-scraper
     env_file:
       - .env
     environment:
@@ -67,6 +72,31 @@ services:
       redis:
         condition: service_healthy
     restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: imobhub-api
+    # O ENTRYPOINT da imagem é o scraper; a API é o segundo binário do mesmo
+    # build, então só o entrypoint muda.
+    entrypoint: ["/app/api"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-imobhub}:${POSTGRES_PASSWORD:-imobhub}@db:5432/${POSTGRES_DB:-imobhub}?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      # Porta dentro do container é fixa; quem varia é a publicada no host
+      # (API_PORT), para não exigir dois valores em sincronia no .env.
+      PORT: 8080
+    ports:
+      - "${API_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   pgdata:

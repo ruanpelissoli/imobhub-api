@@ -2,8 +2,9 @@
 
 ## Purpose
 Todo o código do ImobHub API vive sob `internal/` para que nada seja importável
-por outros módulos: este é um binário, não uma biblioteca. `cmd/scraper` só
-orquestra; a lógica está aqui.
+por outros módulos: este é um repositório de binários, não uma biblioteca.
+`cmd/scraper` (batch de coleta) e `cmd/api` (servidor HTTP) só orquestram; a
+lógica está aqui.
 
 ## Key decisions
 - **Um pacote por responsabilidade técnica**, não por camada. `robots`,
@@ -25,6 +26,8 @@ Grafo de importação atual (mantê-lo acíclico e raso):
 
 ```
 cmd/scraper → config, db, cache, scraper, enrichqueue
+cmd/api     → config, db, cache, api
+api         → pgxpool, go-redis, stdlib   (NÃO importa config)
 cache       → go-redis    (folha, como config e db)
 scraper     → config, db, ratelimit, robots, selectors, sources, pgxpool
 enrichqueue → ai, config, db, enrichment, grouping, pgxpool
@@ -47,6 +50,13 @@ mesmo jeito.
 `robots` **não** importa `httpclient`: precisa de um timeout mais curto e o
 grafo prevê o sentido contrário. O User-Agent chega como string (de `config` ou
 de `httpclient.Client.UserAgent()`).
+
+`api` **não importa `config`** de propósito: recebe pool, client do Redis,
+allowlist de CORS e logger por `api.Deps`, montada em `cmd/api`. É a mesma regra
+de `cache`, que recebe a `REDIS_URL` por parâmetro — quem lê o ambiente é só
+`config`, e quem o repassa é só o `main`. O roteador é o `net/http.ServeMux` da
+stdlib (nenhum `chi`/`gorilla` no `go.mod`); o porquê está em
+`internal/api/CLAUDE.md`.
 
 `config` e `cache` são folhas do grafo — não importam nada do projeto. `cache`
 recebe a `REDIS_URL` por parâmetro (de `cfg.RedisURL`, em `main`) justamente
@@ -106,6 +116,11 @@ comodidades do `TermExtractor` chega por parâmetro de construtor (de
   `MergePropertyData` os relê do banco. Uma **única instância** de geocoder,
   extrator, normalizador e agrupador é compartilhada por todos os workers — o
   geocoder carrega o `DomainLimiter` de 1 req/s do Nominatim.
+- `api/` é o esqueleto do servidor HTTP: roteador com o grupo `/api/v1`
+  (ainda **sem rotas de negócio** — o ponto de extensão é `registerV1Routes`),
+  `/health` de liveness fora do grupo, middlewares de recovery/logging/CORS e a
+  conversão dos 404/405 do `ServeMux` para o envelope `{"error":"..."}`. Esse
+  envelope é convenção do projeto para toda resposta de erro.
 - Logs operacionais usam `log/slog` (handler JSON configurado em `main`). Não
   usar `fmt.Println`/`log.Printf`: quebra o parsing dos logs em produção.
 - Erros são embrulhados com `fmt.Errorf("pacote: ... %w", err)` e sempre citam o

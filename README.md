@@ -1,8 +1,14 @@
 # ImobHub API
 
-Coletor de anúncios de imóveis: lê a lista de fontes (`sources.txt`), respeita o
-`robots.txt` e o rate limit de cada domínio, busca as páginas e persiste os
-anúncios no PostgreSQL.
+Dois binários sobre o mesmo banco:
+
+- **`cmd/scraper`** — processo batch. Lê a lista de fontes (`sources.txt`),
+  respeita o `robots.txt` e o rate limit de cada domínio, busca as páginas,
+  persiste os anúncios no PostgreSQL e os enriquece. **É o dono do schema**: as
+  migrations rodam no startup dele.
+- **`cmd/api`** — servidor HTTP de vida longa que serve o catálogo consolidado.
+  **Não aplica migrations** (uma API de leitura que migra no boot mudaria o
+  schema a cada deploy dela) e só conecta ao Postgres e ao Redis.
 
 ## Requisitos
 
@@ -42,27 +48,37 @@ Copie `.env.example` para `.env` e preencha os valores (na prática, só a
 `ANTHROPIC_API_KEY`: os demais defaults já apontam para os serviços do
 `docker-compose.yml`). As variáveis da aplicação são lidas por
 `internal/config`; nenhum outro pacote chama `os.Getenv`. As variáveis
-`POSTGRES_*` e `*_PORT` existem apenas para o compose.
+`POSTGRES_*`, `*_PORT` e `API_PORT` existem apenas para o compose.
+
+Cada binário lê o subconjunto de que precisa: `cmd/scraper` usa `config.Load()`
+(exige `ANTHROPIC_API_KEY`) e `cmd/api` usa `config.LoadAPI()` (exige apenas
+`DATABASE_URL` e `REDIS_URL`, mais `PORT` e `CORS_ORIGINS` opcionais).
 
 ## Ambiente local com Docker
 
-O `docker-compose.yml` sobe a stack completa: `db` (PostgreSQL), `redis` e
-`api` (a aplicação).
+O `docker-compose.yml` sobe a stack completa: `db` (PostgreSQL), `redis`,
+`scraper` (o batch de coleta) e `api` (o servidor HTTP).
 
 ```bash
-cp .env.example .env            # preencha ANTHROPIC_API_KEY
-docker compose up -d db redis   # só a infraestrutura
-docker compose run --rm api     # executa uma coleta dentro do container
-docker compose down             # para tudo (-v também apaga os volumes)
+cp .env.example .env               # preencha ANTHROPIC_API_KEY
+docker compose up -d db redis      # só a infraestrutura
+docker compose run --rm scraper    # executa uma coleta dentro do container
+docker compose up -d api           # sobe a API em http://localhost:8080
+docker compose down                # para tudo (-v também apaga os volumes)
 ```
 
-A `api` é um processo batch: uma execução coleta todas as fontes e sai — por
-isso `restart: "no"` e o uso de `run` em vez de um serviço sempre ligado. Ela só
-inicia depois que os healthchecks de `db` e `redis` passam, porque as migrations
-rodam no startup.
+> O serviço batch **se chamava `api`** e passou a se chamar `scraper`. Quem
+> automatizou `docker compose run --rm api` esperando uma coleta precisa
+> atualizar o nome — hoje `api` é o servidor HTTP.
+
+O `scraper` é um processo batch: uma execução coleta todas as fontes e sai — por
+isso `restart: "no"` e o uso de `run` em vez de um serviço sempre ligado. A
+`api` é de vida longa (`restart: unless-stopped`) e publica a porta no host via
+`API_PORT` (default `8080`). Os dois só iniciam depois que os healthchecks de
+`db` e `redis` passam.
 
 O mesmo `.env` serve para os dois modos de execução: os valores apontam para
-`localhost` (para `go run` no host) e o serviço `api` sobrescreve
+`localhost` (para `go run` no host) e os serviços do compose sobrescrevem
 `DATABASE_URL`/`REDIS_URL` com os nomes de host da rede do compose.
 
 ## Executar
@@ -74,6 +90,33 @@ go run ./cmd/scraper                 # coleta + enriquecimento (default)
 go run ./cmd/scraper -only=scrape    # só a coleta
 go run ./cmd/scraper -only=enrich    # só a fila de enriquecimento
 ```
+
+### API HTTP
+
+```bash
+docker compose up -d db redis
+go run ./cmd/api
+```
+
+Sobe em `PORT` (default `8080`). Exige apenas `DATABASE_URL` e `REDIS_URL` —
+`ANTHROPIC_API_KEY` e as demais variáveis do scraper não são necessárias.
+Postgres ou Redis fora do ar, ou `PORT` inválida/ocupada, são erro de boot com
+exit 1, nunca fallback silencioso.
+
+```bash
+curl -i localhost:8080/health          # 200 {"status":"ok"}
+curl -i localhost:8080/api/v1/nada     # 404 {"error":"not found"}
+curl -i -X POST localhost:8080/health  # 405 {"error":"method not allowed"}
+
+curl -i -X OPTIONS localhost:8080/api/v1/x \
+  -H 'Origin: http://localhost:3000' \
+  -H 'Access-Control-Request-Method: GET'   # 204 com os headers de CORS
+```
+
+O `/health` é **liveness**: responde 200 sem tocar em Postgres ou Redis, para
+que uma oscilação do banco não faça o orquestrador reiniciar uma API viva. As
+rotas de negócio ficam sob `/api/v1`; SIGINT/SIGTERM disparam shutdown gracioso
+(as requisições em voo terminam antes de o processo sair).
 
 Uma execução aplica as migrations pendentes e roda duas etapas em sequência:
 
