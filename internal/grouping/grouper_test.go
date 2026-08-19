@@ -32,6 +32,21 @@ type fakeStore struct {
 	lastLat, lastLng float64
 	lastRadius       int
 
+	// Estado da consolidação (MergePropertyData).
+	property    *db.Property
+	listings    []db.Listing
+	getErr      error
+	listErr     error
+	updateErr   error
+	getCalls    int
+	listCalls   int
+	updateCalls int
+	// updatedProperty é o struct exato que chegou ao UpdateProperty — é nele
+	// que os testes verificam preservação e idempotência.
+	updatedProperty db.Property
+	lastGetID       string
+	lastListID      string
+
 	// Caminho unitário de remoção (HandleListingRemoval).
 	unlinkedPropertyID string
 	unlinkErr          error
@@ -71,6 +86,36 @@ func (s *fakeStore) LinkListingToProperty(_ context.Context, propertyID string, 
 	s.linkCalls++
 	s.linkedPropertyID, s.linkedListingID = propertyID, listingID
 	return s.linkErr
+}
+
+func (s *fakeStore) GetPropertyByID(_ context.Context, propertyID string) (*db.Property, error) {
+	s.getCalls++
+	s.lastGetID = propertyID
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+	if s.property == nil {
+		return nil, nil
+	}
+	// Cópia: o merge faz read-modify-write, e devolver o mesmo ponteiro deixaria
+	// a segunda chamada enxergar as alterações da primeira sem passar pelo banco.
+	stored := *s.property
+	return &stored, nil
+}
+
+func (s *fakeStore) ListListingsByPropertyID(_ context.Context, propertyID string) ([]db.Listing, error) {
+	s.listCalls++
+	s.lastListID = propertyID
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	return s.listings, nil
+}
+
+func (s *fakeStore) UpdateProperty(_ context.Context, property db.Property) error {
+	s.updateCalls++
+	s.updatedProperty = property
+	return s.updateErr
 }
 
 func (s *fakeStore) UnlinkListingFromProperty(_ context.Context, listingID int64) (string, error) {

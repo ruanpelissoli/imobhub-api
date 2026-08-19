@@ -68,6 +68,22 @@ RETURNING property_id`
 // dezenas de milhares de linhas; o custo do seq scan é irrelevante uma vez por run.
 const countListingsSQL = `SELECT COUNT(*) FROM listings`
 
+// selectListingsByPropertyIDSQL lê os anúncios vinculados a um imóvel canônico,
+// só com as colunas que a consolidação usa. O cast ::uuid segue o padrão de
+// properties_repo.go, e o índice idx_listings_property_id atende ao WHERE.
+//
+// O ORDER BY id **é contrato**, não conveniência: é ele que dá ao merge uma
+// ordem estável de fotos e comodidades, e sem ela o corte em 50 fotos escolheria
+// um conjunto diferente a cada execução.
+//
+// Não há filtro de status porque não existe status: todo anúncio presente na
+// tabela é ativo (os que somem do site são apagados por DeleteStaleListings).
+const selectListingsByPropertyIDSQL = `
+SELECT id, source_domain, listing_url, description_raw, bedroom_count, amenities, image_urls
+FROM listings
+WHERE property_id = $1::uuid
+ORDER BY id`
+
 // UpsertListings insere ou atualiza os anúncios recebidos, renovando
 // last_seen_at de cada um.
 //
@@ -272,6 +288,68 @@ func CountListings(ctx context.Context, pool *pgxpool.Pool) (int64, error) {
 		return 0, fmt.Errorf("db: could not count listings: %w", err)
 	}
 	return total, nil
+}
+
+// ListListingsByPropertyID devolve todos os anúncios vinculados ao imóvel
+// canônico, **ordenados por id**, na forma que a consolidação consome.
+//
+// Imóvel sem anúncios não é erro: devolve uma slice vazia (nunca nil). O vínculo
+// pode ter acabado de ser desfeito, e quem consolida trata isso como no-op.
+func ListListingsByPropertyID(ctx context.Context, pool *pgxpool.Pool, propertyID string) ([]Listing, error) {
+	propertyID = strings.TrimSpace(propertyID)
+	if propertyID == "" {
+		return nil, errors.New("db: list listings by property: property id is required")
+	}
+
+	rows, err := pool.Query(ctx, selectListingsByPropertyIDSQL, propertyID)
+	if err != nil {
+		return nil, fmt.Errorf("db: list listings for property %q: %w", propertyID, err)
+	}
+	defer rows.Close()
+
+	listings := make([]Listing, 0, 8)
+	for rows.Next() {
+		listing, err := scanListing(rows)
+		if err != nil {
+			return nil, fmt.Errorf("db: list listings for property %q: %w", propertyID, err)
+		}
+		listings = append(listings, listing)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: list listings for property %q: %w", propertyID, err)
+	}
+
+	return listings, nil
+}
+
+// scanListing lê uma linha na ordem de selectListingsByPropertyIDSQL.
+// description_raw é nullable e passa por um *string temporário: pgx não escaneia
+// NULL para string, e aqui NULL e "" são a mesma coisa.
+func scanListing(row pgx.Row) (Listing, error) {
+	var (
+		listing        Listing
+		descriptionRaw *string
+	)
+	err := row.Scan(
+		&listing.ID,
+		&listing.SourceDomain,
+		&listing.ListingURL,
+		&descriptionRaw,
+		&listing.BedroomCount,
+		&listing.Amenities,
+		&listing.ImageURLs,
+	)
+	if err != nil {
+		return Listing{}, err
+	}
+
+	if descriptionRaw != nil {
+		listing.DescriptionRaw = *descriptionRaw
+	}
+	listing.Amenities = normalizeTextArray(listing.Amenities)
+	listing.ImageURLs = normalizeTextArray(listing.ImageURLs)
+
+	return listing, nil
 }
 
 // execBatch envia um lote do mesmo statement pelo pipeline do pgx e consome um

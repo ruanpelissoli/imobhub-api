@@ -75,6 +75,20 @@ compartilhado com `ai`, `selectors` e `scraper` — nenhum outro pacote monta SQ
   parcial deixaria anúncios vivos com `last_seen_at` antigo e
   `DeleteStaleListings` os apagaria. O lote existe só para diluir round-trips;
   `CopyFrom` não serve porque não faz `ON CONFLICT`.
+- **`ListListingsByPropertyID` tem `ORDER BY id` como parte do contrato**, não
+  como conveniência: quem consolida o canônico (`grouping.MergePropertyData`)
+  depende dessa ordem para deduplicar fotos e cortá-las em 50 sempre do mesmo
+  jeito. Trocar ou remover o `ORDER BY` quebra a idempotência do merge sem
+  quebrar nenhum teste deste pacote. O `WHERE property_id = $1::uuid` é atendido
+  pelo índice `idx_listings_property_id` (criado em `migrations/004`). Imóvel sem
+  anúncios devolve slice vazia, nunca `nil` nem erro.
+- **`db.Listing` é o modelo de leitura, separado de `RawListing`.** `RawListing`
+  é o modelo de **escrita** da coleta: identidade `(SourceDomain, ListingURL)`,
+  sem `id`, com `ExtraData`. O de leitura precisa do `id` (é a ordem estável do
+  merge) e só carrega as colunas que a consolidação usa. Fundir os dois obrigaria
+  a coleta a preencher campos que ela não tem. `description_raw` é nullable e
+  chega como `""` (mesma convenção dos `_raw`); os `TEXT[]` passam por
+  `normalizeTextArray`.
 - `image_urls` e `extra_data` nunca gravam NULL (nil vira `[]`/`{}`): a coleta
   não distingue "sem imagens" de "não sei", e o leitor não deveria ter que
   distinguir. A mesma regra vale para `properties.amenities`/`photos`, e mora
@@ -196,7 +210,8 @@ compartilhado com `ai`, `selectors` e `scraper` — nenhum outro pacote monta SQ
 `selectors`, `ai` e `scraper` consomem `SelectorConfig`/`RawListing` daqui. Os
 arquivos de schema ficam em `migrations/` na raiz — ver o CLAUDE.md de lá para
 as regras das tabelas `site_selectors`, `listings` (incluindo as colunas de
-enriquecimento) e `properties`. A regra de deduplicação (que combinação de
+enriquecimento) e `properties`. `grouping` consome `Property`, `Listing` e as
+funções de busca/vínculo/consolidação/desvínculo. A regra de deduplicação (que combinação de
 endereço/geo/atributos identifica o mesmo imóvel) **não** vive aqui: este pacote
 só oferece o vínculo `listing → property`; quem decide o vínculo é o pipeline de
 enriquecimento.

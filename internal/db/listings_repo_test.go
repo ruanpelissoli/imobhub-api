@@ -129,6 +129,21 @@ func TestListingArgsRejectsUnserializableExtraData(t *testing.T) {
 	}
 }
 
+// A guarda de id vazio precisa valer antes de qualquer ida ao banco: com um
+// pool nil, chegar à query seria panic — é assim que o teste prova que ela
+// existe.
+func TestListListingsByPropertyIDRejectsBlankPropertyID(t *testing.T) {
+	for _, id := range []string{"", "   "} {
+		_, err := ListListingsByPropertyID(context.Background(), nil, id)
+		if err == nil {
+			t.Fatalf("ListListingsByPropertyID(%q) error = nil, want an error", id)
+		}
+		if !strings.Contains(err.Error(), "property id is required") {
+			t.Errorf("error = %q, want it to mention the missing property id", err)
+		}
+	}
+}
+
 func TestNormalizeImageURLsNeverReturnsNil(t *testing.T) {
 	// nil precisa virar array vazio: a coluna image_urls nunca guarda NULL.
 	if got := normalizeImageURLs(nil); got == nil {
