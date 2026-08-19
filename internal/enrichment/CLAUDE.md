@@ -1,81 +1,92 @@
-# enrichment/ — normalização de bairros
+# enrichment/ — normalização de bairros e geocodificação
 
 ## Purpose
-Deriva a forma canônica do bairro a partir do texto bruto do anúncio. Cada
-portal escreve o mesmo lugar de um jeito (`"Jd. Botânico"`, `"JARDIM BOTANICO"`,
-`"jardim botanico"`); o agrupamento por região usa
-`listings.normalized_neighborhood`, então grafias divergentes do mesmo bairro
-quebram o agrupamento em silêncio.
+Deriva campos canônicos a partir do texto bruto do anúncio. Dois serviços:
+`NeighborhoodNormalizer` (`neighborhood.go`) → `listings.normalized_neighborhood`;
+`Geocoder` (`geocoder*.go`) → `listings.lat`/`lng`. Nenhum deles tem chamador
+ainda — persistir os campos (fila por `enriched_at IS NULL`, UPDATE em
+`internal/db`, wiring em `cmd/scraper`) é follow-up **compartilhado** entre os
+enrichers. Não duplicar esse plumbing por enricher.
 
-O pacote entrega **só o normalizador puro**: entra string, sai string. Sem
-banco, sem rede, sem IA.
+**O pacote deixou de ser puro** com o geocoder: ele faz rede (Nominatim) e
+importa `internal/ratelimit`. Continua **não** tocando banco.
 
-## Key decisions
+## Key decisions — geocoder
+- **`ratelimit.DomainLimiter` reusado, não um `time.Ticker` novo.** Ele já dá
+  espaçamento fixo por host, sem burst e cancelável por contexto — a política do
+  Nominatim (máx. 1 req/s). Aresta nova `enrichment → ratelimit`: acíclica e
+  rasa. O `Wait` fica **imediatamente antes** do `Do`; o tempo entre os dois sai
+  do intervalo efetivo.
+- **`countrycodes=br` é correção, não otimização:** sem ele `"Centro, Rio"` casa
+  com um lugar em Portugal. Query montada com `net/url` — concatenação quebraria
+  em endereços com `&` ou acento.
+- **User-Agent vem do construtor** (`cfg.ScraperUserAgent`), nunca de
+  `os.Getenv`. Construtor **erra** se vier vazio: sem o header o Nominatim
+  responde 403, e falhar no boot é melhor que na primeira requisição da run.
+- **`Doer` injetável** (satisfeito por `*http.Client`) para os testes não tocarem
+  a rede; o construtor padrão cria client próprio sem cookie jar, mesmo
+  raciocínio de `httpclient.FetchStatic`. O geocoder **não** usa `FetchStatic`:
+  aquilo é feito para HTML e não limita o corpo.
+- **Constantes de provider duplicadas em `config` e aqui.** `config` é folha do
+  grafo e não pode importar `enrichment`; valida no boot (desconhecido é erro,
+  não fallback) e `NewGeocoder` valida de novo. Defesa em profundidade.
+- **Google Maps é stub deliberado** (`ErrProviderNotSupported`, zero HTTP, zero
+  dependência nova): fixa a costura de troca de provider sem antecipar o SDK.
+
+## Business logic — geocoder
+Sentinelas (todas `errors.Is`, prefixo `enrichment:`):
+- **`ErrAddressNotFound`** — 200 com zero resultados. **Não é falha**: o chamador
+  grava NULL e segue. Rede/timeout/status ≥ 400 dão erros **distintos**, para a
+  fila não confundir "não existe" com "não deu para perguntar agora".
+- **`ErrEmptyAddress`** — endereço vazio; retorna sem requisição alguma.
+- **`ErrInvalidCoordinates`** — não parseável ou fora de `[-90,90]`/`[-180,180]`
+  (inclui `NaN`/`Inf`, que `ParseFloat` aceita). Gravar ponto errado é pior que
+  não gravar nada.
+- **`ErrProviderNotSupported`** / **`ErrMissingUserAgent`** — erros de construção.
+
+Cache em memória por chave normalizada (`normalizeKey`, o mesmo tratamento das
+chaves de alias), com **negative caching**: reperguntar o mesmo endereço
+irresolvível a cada anúncio do condomínio é o pior desperdício de quota. Erro de
+rede/timeout/status **não** entra no cache — é transitório.
+
+**Fronteira:** o geocoder **não consulta o banco**. O filtro "anúncio já
+geocodificado" (`lat IS NULL`) é da fila de enriquecimento, não daqui.
+
+## Key decisions — normalizador de bairros
 - **Tabela de aliases embutida via `//go:embed`, em JSON, dentro do pacote.**
-  `//go:embed` não alcança caminhos acima do diretório do pacote, então
-  `configs/*.yaml` está fora. Embutir evita uma variável de ambiente nova (o
-  `internal/config` tem ritual de atualização em três lugares) e evita repetir o
-  gotcha de `migrations/` e `sources.txt`, que precisam de `COPY` no Dockerfile
-  e falham em runtime quando alguém esquece. JSON e não YAML porque
-  `go.yaml.in/yaml/v4` é dependência **indireta** — `encoding/json` é stdlib e
-  não mexe no `go.mod`.
-- **`Setor` NÃO é removido.** Em Brasília e Goiânia, `Setor Sudoeste`,
-  `Setor Bueno` e `Setor Oeste` são nomes reais de bairro; removê-la corromperia
-  o dado sem deixar rastro. Só `Bairro` é tratada como palavra redundante. Casos
-  em que `Setor` de fato sobra vão para a tabela de aliases — que é o mecanismo
-  de escape por design. Isto substitui conscientemente o critério original da
-  task ("remover sufixos redundantes: Bairro, Setor").
-- **Alias vence e volta verbatim.** A tabela manda na grafia final, acentos e
-  maiúsculas inclusive — nada de re-aplicar title-case por cima, senão
-  `"Águas Claras"` viraria outra coisa a cada ajuste do caser.
-- **Acento removido só na chave de comparação.** O fallback devolve a string
-  limpa em title-case com os acentos **originais**. Inventar acento
-  (`"Acacias"` → `"Acácias"`) exigiria dicionário; errar a grafia é pior que
-  preservá-la. Acentuação correta vem por alias.
-- **Chave duplicada ⇒ erro, não silêncio.** `encoding/json` aceita chave
-  repetida (a última vence), então `AliasMap`/`CityAliasMap` têm `UnmarshalJSON`
-  próprio que percorre tokens. Há uma segunda checagem depois de normalizar as
-  chaves, que pega colisões lógicas (`"Asa Norte"` vs. `"asa  norte"`).
+  `//go:embed` não alcança caminhos acima do pacote (`configs/*.yaml` está fora).
+  Embutir evita mais uma variável de ambiente e o gotcha de `migrations/` e
+  `sources.txt`, que precisam de `COPY` no Dockerfile. JSON e não YAML porque
+  `go.yaml.in/yaml/v4` é dependência **indireta**.
+- **`Setor` NÃO é removido.** `Setor Sudoeste`/`Bueno`/`Oeste` são nomes reais de
+  bairro em Brasília e Goiânia. Só `Bairro` é redundante; o resto vai por alias.
+  Substitui conscientemente o critério original da task.
+- **Alias vence e volta verbatim** (a tabela manda na grafia final) e **acento é
+  removido só na chave de comparação** — inventar acento exigiria dicionário.
+- **Chave duplicada ⇒ erro**, inclusive colisão após normalizar (`"Asa Norte"`
+  vs. `"asa  norte"`): `encoding/json` aceitaria a repetida em silêncio.
 
-## Business logic
-Pipeline de `Normalize(raw, city)`, nesta ordem: trim + colapso de espaços →
-remoção de `Bairro` (prefixo ou sufixo, sem caixa e sem acento, tolerando
-pontuação colada) → se sobrou vazio, `""` → chave de busca (minúsculas + sem
-acento + espaços colapsados + pontuação de borda descartada) → alias da cidade →
-alias global → fallback em title-case pt-BR.
-
-Invariantes:
-- Entrada vazia, só espaços ou só pontuação ⇒ `""`. O chamador grava **NULL**,
-  nunca string vazia.
-- `city == ""` consulta apenas a seção global. Hoje **nenhum chamador tem
-  cidade**: `listings` não tem coluna `city` (só `properties` tem). O parâmetro
-  existe porque aliases são conceitualmente por cidade ("Centro" existe em toda
-  cidade) e para a assinatura não mudar quando o parsing de endereço evoluir.
-- Cidade vence global: `"Sudoeste"` é `"Sudoeste"` em geral e `"Setor Sudoeste"`
-  em Brasília.
-- Função pura e determinística; `Normalize(Normalize(x)) == Normalize(x)`.
+Pipeline de `Normalize(raw, city)`: trim/colapso → remoção de `Bairro` → chave de
+busca → alias da cidade → alias global → fallback title-case pt-BR. Entrada vazia
+ou só pontuação ⇒ `""` (o chamador grava **NULL**). `city == ""` consulta só a
+seção global — é o caso de hoje, `listings` não tem coluna `city`; o parâmetro
+existe para a assinatura não mudar. Função pura e idempotente.
 
 ## Dependencies
-Stdlib + `golang.org/x/text` (`cases`, `language`, `runes`, `transform`,
-`unicode/norm`) — já dependência **direta** no `go.mod`, então nada foi somado.
-O pacote **não importa `internal/db`**: é folha do grafo, junto com `config`.
-Ninguém o consome ainda — persistir `normalized_neighborhood` (fila por
-`enriched_at IS NULL`, UPDATE em `internal/db`, wiring em `cmd/scraper`) é task
-de follow-up, compartilhada com os demais enrichers.
+Stdlib + `golang.org/x/text` (já dependência direta) + `internal/ratelimit`.
+**Não importa `internal/db`.**
 
 ## Gotchas
-- **`cases.Caser` e `transform.Transformer` guardam estado e não são seguros
-  para uso concorrente.** Por isso são construídos **por chamada** dentro dos
-  helpers, e não guardados como campo do struct — a fila de enriquecimento
-  futura é concorrente e o sintoma seria saída corrompida, não panic. Se algum
-  profiling mostrar que pesa, a correção é `sync.Pool`, nunca campo
-  compartilhado. `TestNormalizeIsSafeForConcurrentUse` existe para flagrar isso;
-  `-race` não roda neste ambiente (exige cgo/gcc).
-- As chaves do JSON passam pela mesma normalização da entrada, então o arquivo
-  pode ser escrito em forma legível (`"Jd. Botânico"`). Consequência: duas
-  grafias que colapsam na mesma chave são erro de construção.
-- `cases.Title` produziria `"D'água"` (trata o apóstrofo como fim de palavra);
-  há uma regra explícita para o prefixo `d'`. Outros casos com apóstrofo ou
-  hífen (`"Sant'Ana"`) resolvem-se por alias.
-- Pontuação **interna** é preservada na chave: a de `"Jd. Botânico"` é
-  `"jd. botanico"` — é assim que a entrada precisa estar escrita na tabela.
+- **`cases.Caser` e `transform.Transformer` guardam estado**, por isso são
+  construídos **por chamada** — a fila futura é concorrente e o sintoma seria
+  saída corrompida, não panic. `-race` não roda aqui (exige cgo/gcc); os testes
+  `...IsSafeForConcurrentUse` existem para flagrar.
+- Pontuação **interna** é preservada na chave (`"Jd. Botânico"` → `"jd.
+  botanico"`) — é assim que a entrada vai escrita na tabela.
+- `cases.Title` produziria `"D'água"`; há regra explícita para o prefixo `d'`.
+  `"Sant'Ana"` e afins resolvem-se por alias.
+- **O cache do geocoder não tem TTL nem limite de tamanho** e vive enquanto o
+  processo vive (mesma escolha do cache de `robots.Checker`).
+- **O erro de status não é tipado** (não há `StatusError` como em `httpclient`):
+  o chamador não distingue 429 de 500 programaticamente. Quando a fila precisar
+  de backoff, é aqui que o tipo entra.

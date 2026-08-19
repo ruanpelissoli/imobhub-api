@@ -38,6 +38,15 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if cfg.MigrationsDir != DefaultMigrationsDir {
 		t.Errorf("MigrationsDir = %q, want %q", cfg.MigrationsDir, DefaultMigrationsDir)
 	}
+	if cfg.GeocodingProvider != DefaultGeocodingProvider {
+		t.Errorf("GeocodingProvider = %q, want %q", cfg.GeocodingProvider, DefaultGeocodingProvider)
+	}
+	if cfg.GeocodingAPIKey != "" {
+		t.Errorf("GeocodingAPIKey = %q, want %q", cfg.GeocodingAPIKey, "")
+	}
+	if want := DefaultGeocodingRateLimitMS * time.Millisecond; cfg.GeocodingRateLimit != want {
+		t.Errorf("GeocodingRateLimit = %v, want %v", cfg.GeocodingRateLimit, want)
+	}
 }
 
 func TestLoadReadsOverrides(t *testing.T) {
@@ -63,6 +72,95 @@ func TestLoadReadsOverrides(t *testing.T) {
 	}
 	if cfg.MigrationsDir != "db/migrations" {
 		t.Errorf("MigrationsDir = %q, want %q", cfg.MigrationsDir, "db/migrations")
+	}
+}
+
+func TestLoadReadsGeocodingOverrides(t *testing.T) {
+	setRequired(t)
+	t.Setenv(envGeocodingProvider, "  GoogleMaps  ") // espaços e caixa toleradas
+	t.Setenv(envGeocodingAPIKey, "gm-secret")
+	t.Setenv(envGeocodingRateLimit, "250")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+
+	if cfg.GeocodingProvider != ProviderGoogleMaps {
+		t.Errorf("GeocodingProvider = %q, want %q", cfg.GeocodingProvider, ProviderGoogleMaps)
+	}
+	if cfg.GeocodingAPIKey != "gm-secret" {
+		t.Errorf("GeocodingAPIKey = %q, want %q", cfg.GeocodingAPIKey, "gm-secret")
+	}
+	if want := 250 * time.Millisecond; cfg.GeocodingRateLimit != want {
+		t.Errorf("GeocodingRateLimit = %v, want %v", cfg.GeocodingRateLimit, want)
+	}
+}
+
+func TestLoadRejectsUnknownGeocodingProvider(t *testing.T) {
+	setRequired(t)
+	t.Setenv(envGeocodingProvider, "mapquest")
+
+	// Provider desconhecido é erro de boot, nunca fallback silencioso para o
+	// nominatim: as coordenadas sairiam de um serviço diferente do configurado.
+	_, err := Load()
+	if err == nil {
+		t.Fatalf("Load() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), envGeocodingProvider) {
+		t.Errorf("error %q does not mention %q", err.Error(), envGeocodingProvider)
+	}
+}
+
+func TestLoadRequiresAPIKeyOnlyForGoogleMaps(t *testing.T) {
+	t.Run("googlemaps sem chave", func(t *testing.T) {
+		setRequired(t)
+		t.Setenv(envGeocodingProvider, ProviderGoogleMaps)
+		t.Setenv(envGeocodingAPIKey, "")
+
+		_, err := Load()
+		if !errors.Is(err, ErrMissingRequired) {
+			t.Fatalf("Load() error = %v, want ErrMissingRequired", err)
+		}
+		if !strings.Contains(err.Error(), envGeocodingAPIKey) {
+			t.Errorf("error %q does not mention %q", err.Error(), envGeocodingAPIKey)
+		}
+	})
+
+	t.Run("nominatim sem chave", func(t *testing.T) {
+		setRequired(t)
+		t.Setenv(envGeocodingProvider, ProviderNominatim)
+		t.Setenv(envGeocodingAPIKey, "")
+
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load() error = %v, want nil (nominatim does not use an API key)", err)
+		}
+	})
+}
+
+func TestLoadRejectsInvalidGeocodingRateLimit(t *testing.T) {
+	for _, raw := range []string{"abc", "-1"} {
+		t.Run(raw, func(t *testing.T) {
+			setRequired(t)
+			t.Setenv(envGeocodingRateLimit, raw)
+
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load() with %s=%q error = nil, want error", envGeocodingRateLimit, raw)
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsZeroGeocodingRateLimit(t *testing.T) {
+	setRequired(t)
+	t.Setenv(envGeocodingRateLimit, "0")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+	if cfg.GeocodingRateLimit != 0 {
+		t.Errorf("GeocodingRateLimit = %v, want 0 (disabled)", cfg.GeocodingRateLimit)
 	}
 }
 

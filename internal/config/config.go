@@ -19,12 +19,35 @@ const (
 	DefaultUserAgent     = "ImobHubBot/1.0"
 	DefaultRateLimitMS   = 2000
 	DefaultMigrationsDir = "migrations"
-	envDatabaseURL       = "DATABASE_URL"
-	envAnthropicAPIKey   = "ANTHROPIC_API_KEY"
-	envSourcesFile       = "SOURCES_FILE"
-	envScraperUserAgent  = "SCRAPER_USER_AGENT"
-	envScraperRateLimit  = "SCRAPER_RATE_LIMIT_MS"
-	envMigrationsDir     = "MIGRATIONS_DIR"
+	// DefaultGeocodingProvider é o provider de geocodificação usado quando
+	// GEOCODING_PROVIDER não está definida. Nominatim é gratuito e não exige
+	// chave; por isso é o default.
+	DefaultGeocodingProvider = ProviderNominatim
+	// DefaultGeocodingRateLimitMS é o intervalo mínimo entre requisições ao
+	// provider de geocodificação. O Nominatim permite no máximo 1 req/s.
+	DefaultGeocodingRateLimitMS = 1000
+
+	envDatabaseURL        = "DATABASE_URL"
+	envAnthropicAPIKey    = "ANTHROPIC_API_KEY"
+	envSourcesFile        = "SOURCES_FILE"
+	envScraperUserAgent   = "SCRAPER_USER_AGENT"
+	envScraperRateLimit   = "SCRAPER_RATE_LIMIT_MS"
+	envMigrationsDir      = "MIGRATIONS_DIR"
+	envGeocodingProvider  = "GEOCODING_PROVIDER"
+	envGeocodingAPIKey    = "GEOCODING_API_KEY"
+	envGeocodingRateLimit = "GEOCODING_RATE_LIMIT_MS"
+)
+
+// Providers de geocodificação aceitos em GEOCODING_PROVIDER.
+//
+// As mesmas constantes existem em internal/enrichment. A duplicação é
+// consciente: config é folha do grafo de importação (ver internal/CLAUDE.md) e
+// não pode importar enrichment. config valida no boot — valor desconhecido é
+// erro, nunca fallback silencioso — e enrichment.NewGeocoder valida de novo,
+// devolvendo ErrProviderNotSupported. Defesa em profundidade.
+const (
+	ProviderNominatim  = "nominatim"
+	ProviderGoogleMaps = "googlemaps"
 )
 
 // Config agrupa toda a configuração de runtime do scraper.
@@ -44,6 +67,16 @@ type Config struct {
 	// MigrationsDir é o diretório com os arquivos .sql de migration aplicados
 	// no startup. Relativo ao working directory do processo.
 	MigrationsDir string
+	// GeocodingProvider indica qual serviço converte endereço em coordenadas.
+	// Já normalizado e validado: só ProviderNominatim ou ProviderGoogleMaps
+	// chegam aqui.
+	GeocodingProvider string
+	// GeocodingAPIKey é a chave do provider de geocodificação. Vazia para
+	// nominatim (que não exige chave); obrigatória para googlemaps.
+	GeocodingAPIKey string
+	// GeocodingRateLimit é o intervalo mínimo entre requisições ao provider de
+	// geocodificação.
+	GeocodingRateLimit time.Duration
 }
 
 // ErrMissingRequired indica que uma ou mais variáveis obrigatórias não foram
@@ -66,30 +99,71 @@ func Load() (*Config, error) {
 		missing = append(missing, envAnthropicAPIKey)
 	}
 
+	// O provider é resolvido antes do relatório de faltantes porque decide se a
+	// GEOCODING_API_KEY é obrigatória. Valor desconhecido é erro de boot, não
+	// fallback silencioso: quem digitou "google" errado espera as cotas do
+	// Google e receberia, sem aviso, as coordenadas do Nominatim.
+	geocodingProvider := strings.ToLower(lookup(envGeocodingProvider, DefaultGeocodingProvider))
+	switch geocodingProvider {
+	case ProviderNominatim, ProviderGoogleMaps:
+	default:
+		return nil, fmt.Errorf("config: %s must be one of %q or %q, got %q",
+			envGeocodingProvider, ProviderNominatim, ProviderGoogleMaps, geocodingProvider)
+	}
+
+	// A chave só é obrigatória para googlemaps; o Nominatim é gratuito e não
+	// aceita chave nenhuma.
+	geocodingAPIKey := lookup(envGeocodingAPIKey, "")
+	if geocodingProvider == ProviderGoogleMaps && geocodingAPIKey == "" {
+		missing = append(missing, envGeocodingAPIKey)
+	}
+
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("%w: %s", ErrMissingRequired, strings.Join(missing, ", "))
 	}
 
-	rateLimitMS := DefaultRateLimitMS
-	if raw := lookup(envScraperRateLimit, ""); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil {
-			return nil, fmt.Errorf("config: %s must be an integer number of milliseconds, got %q: %w", envScraperRateLimit, raw, err)
-		}
-		if parsed < 0 {
-			return nil, fmt.Errorf("config: %s must be zero or positive, got %d", envScraperRateLimit, parsed)
-		}
-		rateLimitMS = parsed
+	rateLimitMS, err := parseRateLimitMS(envScraperRateLimit, DefaultRateLimitMS)
+	if err != nil {
+		return nil, err
+	}
+
+	geocodingRateLimitMS, err := parseRateLimitMS(envGeocodingRateLimit, DefaultGeocodingRateLimitMS)
+	if err != nil {
+		return nil, err
 	}
 
 	return &Config{
-		DatabaseURL:      databaseURL,
-		AnthropicAPIKey:  anthropicKey,
-		SourcesFile:      lookup(envSourcesFile, DefaultSourcesFile),
-		ScraperUserAgent: lookup(envScraperUserAgent, DefaultUserAgent),
-		ScraperRateLimit: time.Duration(rateLimitMS) * time.Millisecond,
-		MigrationsDir:    lookup(envMigrationsDir, DefaultMigrationsDir),
+		DatabaseURL:        databaseURL,
+		AnthropicAPIKey:    anthropicKey,
+		SourcesFile:        lookup(envSourcesFile, DefaultSourcesFile),
+		ScraperUserAgent:   lookup(envScraperUserAgent, DefaultUserAgent),
+		ScraperRateLimit:   time.Duration(rateLimitMS) * time.Millisecond,
+		MigrationsDir:      lookup(envMigrationsDir, DefaultMigrationsDir),
+		GeocodingProvider:  geocodingProvider,
+		GeocodingAPIKey:    geocodingAPIKey,
+		GeocodingRateLimit: time.Duration(geocodingRateLimitMS) * time.Millisecond,
 	}, nil
+}
+
+// parseRateLimitMS lê um intervalo em milissegundos com as regras comuns a
+// todos os rate limits do projeto: inteiro, zero desativa o espaçamento
+// (só para testes locais) e negativo é erro. Existe para que
+// SCRAPER_RATE_LIMIT_MS e GEOCODING_RATE_LIMIT_MS não divirjam.
+func parseRateLimitMS(envName string, fallback int) (int, error) {
+	raw := lookup(envName, "")
+	if raw == "" {
+		return fallback, nil
+	}
+
+	parsed, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be an integer number of milliseconds, got %q: %w", envName, raw, err)
+	}
+	if parsed < 0 {
+		return 0, fmt.Errorf("config: %s must be zero or positive, got %d", envName, parsed)
+	}
+
+	return parsed, nil
 }
 
 // lookup retorna o valor da variável de ambiente sem espaços nas bordas, ou
