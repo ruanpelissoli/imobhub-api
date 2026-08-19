@@ -8,15 +8,26 @@ ambiente diretamente.
 ## Business logic
 - **Obrigatórias:** `DATABASE_URL`, `ANTHROPIC_API_KEY`. Sem elas o processo não
   sobe.
+- **Obrigatória condicional:** `GEOCODING_API_KEY`, exigida **apenas** quando
+  `GEOCODING_PROVIDER=googlemaps` (o Nominatim é gratuito e não aceita chave).
+  Por isso o provider é resolvido **antes** do relatório de faltantes — a falta
+  da chave entra na mesma lista acumulada das demais obrigatórias.
 - **Opcionais com default:** `SOURCES_FILE` (`sources.txt`),
   `SCRAPER_USER_AGENT` (`ImobHubBot/1.0`), `SCRAPER_RATE_LIMIT_MS` (`2000`),
-  `MIGRATIONS_DIR` (`migrations`), `AMENITIES_FILE`
-  (`configs/amenities.yaml` — vocabulário de comodidades de
+  `MIGRATIONS_DIR` (`migrations`), `GEOCODING_PROVIDER` (`nominatim`),
+  `GEOCODING_RATE_LIMIT_MS` (`1000`, limite de 1 req/s do Nominatim),
+  `AMENITIES_FILE` (`configs/amenities.yaml` — vocabulário de comodidades de
   `internal/enrichment`).
-- `SCRAPER_RATE_LIMIT_MS` é convertido para `time.Duration` aqui, não nos
-  chamadores: quem consome a config recebe uma duração já tipada e não precisa
-  saber que a unidade original era milissegundo. `0` é aceito e desativa o rate
-  limiting; negativo é erro.
+- **`GEOCODING_PROVIDER` fora de `{nominatim, googlemaps}` é erro de boot**,
+  nunca fallback silencioso: quem digitou "google" errado esperava as cotas e a
+  precisão do Google e receberia, sem aviso, as coordenadas do Nominatim. O
+  valor é normalizado (trim + lower) antes de validar.
+- Os dois rate limits (`SCRAPER_RATE_LIMIT_MS` e `GEOCODING_RATE_LIMIT_MS`) são
+  convertidos para `time.Duration` aqui, não nos chamadores: quem consome a
+  config recebe uma duração já tipada e não precisa saber que a unidade original
+  era milissegundo. `0` é aceito e desativa o rate limiting; negativo é erro. As
+  regras de parsing vivem em `parseRateLimitMS`, compartilhado pelas duas
+  variáveis para que não divirjam.
 
 ## Key decisions
 - **Variável vazia == ausente.** `lookup` trata `""` como não definida e aplica
@@ -47,3 +58,10 @@ Importado por `cmd/scraper`.
   vieram: relativos ao **working directory do processo**, não à raiz do
   repositório. No container, o `Dockerfile` precisa copiar o arquivo/diretório
   correspondente para `/app` — senão o default aponta para algo inexistente.
+- `ProviderNominatim`/`ProviderGoogleMaps` existem **também** em
+  `internal/enrichment`. A duplicação é consciente: `config` é folha do grafo e
+  não pode importar `enrichment`. `config` valida no boot, `enrichment.NewGeocoder`
+  valida de novo — defesa em profundidade. Ao adicionar um provider, mexa nos dois.
+- `GEOCODING_API_KEY` nunca aparece em log nem em mensagem de erro. `Config` é
+  logada em lugar nenhum; se isso mudar, redija a chave (mesma regra da
+  `DATABASE_URL`, que carrega a senha).

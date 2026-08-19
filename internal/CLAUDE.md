@@ -29,7 +29,7 @@ scraper     → config, db, ratelimit, robots, selectors, sources, pgxpool
 selectors   → ai, db, httpclient
 ai          → db          (SelectorFields e as constantes de render mode)
 robots      → net/http (client próprio, timeout de 10s para o robots.txt)
-enrichment  → stdlib + x/text (normalização e fold) + yaml/v4 (vocabulário de comodidades)
+enrichment  → ratelimit, net/http (client próprio, timeout de 10s), stdlib + x/text + yaml/v4 (vocabulário de comodidades)
 ```
 
 `scraper` chega a `httpclient` **através** de `selectors.StaticFetcher`/
@@ -41,10 +41,16 @@ mesmo jeito.
 grafo prevê o sentido contrário. O User-Agent chega como string (de `config` ou
 de `httpclient.Client.UserAgent()`).
 
-`config` não importa nada do projeto — é a folha do grafo. `enrichment` também:
-sem banco, sem rede, sem IA. O vocabulário de comodidades chega por parâmetro de
-construtor (de `config.AmenitiesFile`); a tabela de aliases de bairros é embutida
-via `//go:embed`, sem variável de ambiente extra nem `COPY` no Dockerfile.
+`config` é a única folha do grafo — não importa nada do projeto.
+
+`enrichment` **era** folha e deixou de ser com o geocoder: ele fala com o
+Nominatim e reusa `ratelimit.DomainLimiter` (espaçamento fixo por host, sem
+burst, cancelável — exatamente a política de 1 req/s do Nominatim) em vez de um
+`time.Ticker` próprio. A aresta `enrichment → ratelimit` é acíclica e rasa. O
+pacote continua **sem tocar banco e sem IA**: o normalizador de bairros segue
+puro e carrega sua tabela de aliases embutida com `//go:embed`; o vocabulário de
+comodidades do `TermExtractor` chega por parâmetro de construtor (de
+`config.AmenitiesFile`) via `yaml/v4`.
 
 ## Gotchas
 - `selectors/` já está implementado (`SelectorService`: reuso da linha
@@ -60,11 +66,15 @@ via `//go:embed`, sem variável de ambiente extra nem `COPY` no Dockerfile.
   `httpclient.FetchHeadless` — busca de página (estática ou headless) é
   responsabilidade de `httpclient`. `sources/` já está implementado (`ReadSources`) — o `doc.go`
   dele deu lugar a `reader.go`, que carrega o doc do pacote.
-- **`enrichment/` ainda não tem chamador.** O pacote entrega `TermExtractor`
-  (quartos + comodidades a partir do texto livre) e `NeighborhoodNormalizer`
-  (bairro canônico), ambos prontos e testados, mas nada em `cmd/scraper` os
-  constrói. O wiring entra junto com a fila de enriquecimento
-  (`listings.enriched_at IS NULL`); não duplicar esse plumbing por enricher.
+- `enrichment/` entrega hoje o normalizador de bairros
+  (`NeighborhoodNormalizer.Normalize`), o geocoder (`Geocoder.Geocode`, via
+  Nominatim) e o extrator de termos (`TermExtractor.Extract`, quartos +
+  comodidades), e **nenhum deles tem chamador**. Persistir os campos —
+  `normalized_neighborhood`, `lat`/`lng`, e `bedroom_count`/`amenities` —
+  com fila por `enriched_at IS NULL`, função de UPDATE em `db` e wiring em
+  `cmd/scraper` é task de follow-up **compartilhada**. Não duplicar esse
+  plumbing por enricher. Em particular, o filtro "anúncio já geocodificado"
+  (`lat IS NULL`) é da fila, não do geocoder: `enrichment` não importa `db`.
   Quem ligar o `TermExtractor` carrega o vocabulário **uma vez** com
   `enrichment.NewTermExtractor(cfg.AmenitiesFile)` e injeta o extrator — não
   chame o loader por anúncio.

@@ -59,6 +59,13 @@ fontes de sobrecarga e reduz o risco de o bot ser bloqueado. API única:
   máquina muito carregada as margens são folgadas de propósito; não as aperte.
 
 ## Dependencies
-Apenas a stdlib. Instanciado uma única vez em `cmd/scraper` e compartilhado;
-será consumido por `internal/scraper`. O intervalo vem de
-`config.Config.ScraperRateLimit` (`SCRAPER_RATE_LIMIT_MS`, default 2000).
+Apenas a stdlib. Dois consumidores, com limiters **independentes**:
+- `internal/scraper` — instanciado uma única vez em `cmd/scraper` e
+  compartilhado. Intervalo de `config.Config.ScraperRateLimit`
+  (`SCRAPER_RATE_LIMIT_MS`, default 2000).
+- `internal/enrichment` — o geocoder cria o seu próprio, com a chave sendo o
+  host do Nominatim. Intervalo de `config.Config.GeocodingRateLimit`
+  (`GEOCODING_RATE_LIMIT_MS`, default 1000, que é o teto de 1 req/s da política
+  do Nominatim). Limiter separado de propósito: o host de geocodificação não
+  compete com os portais raspados, e unificar faria a coleta esperar pela
+  geocodificação sem motivo.
