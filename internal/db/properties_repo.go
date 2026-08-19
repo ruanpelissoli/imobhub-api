@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -26,7 +27,16 @@ var (
 	ErrPropertyHasListings = errors.New("db: property still has active listings")
 	// ErrListingNotFound indica que o anúncio a vincular não existe.
 	ErrListingNotFound = errors.New("db: listing not found")
+	// ErrInvalidPropertyID indica que o id não é conversível para uuid pelo
+	// PostgreSQL. Existe para que o handler HTTP responda 400 (e não 500) sem
+	// inspecionar o erro do pgx nem validar formato de UUID em Go — o PG aceita
+	// formas que uma regex rejeitaria (sem hífens, entre chaves).
+	ErrInvalidPropertyID = errors.New("db: invalid property id")
 )
+
+// pgInvalidTextRepresentation é o SQLSTATE 22P02, o que o PostgreSQL devolve
+// quando o texto não converte para o tipo alvo — aqui, `$1::uuid`.
+const pgInvalidTextRepresentation = "22P02"
 
 // propertyColumns é a lista de colunas lida por todo SELECT deste arquivo, na
 // ordem em que scanProperty as consome. Centralizada para que acrescentar uma
@@ -61,6 +71,23 @@ const selectPropertyByIDSQL = `
 SELECT` + propertyColumns + `
 FROM properties
 WHERE id = $1::uuid`
+
+// selectPropertyListingsSQL lê os anúncios de um imóvel para a tela de
+// comparação entre portais: fonte, preço bruto e última vez visto. É uma query
+// própria (e não o selectListingsByPropertyIDSQL do merge) porque as colunas são
+// outras, e o merge não pode ganhar colunas que não usa.
+//
+// O ORDER BY id é contrato: a ordem dos anúncios na resposta precisa ser a mesma
+// entre chamadas, senão a tela reordena sozinha a cada refresh. O índice
+// idx_listings_property_id (migrations/004) atende ao WHERE.
+//
+// Não há filtro de status porque não existe status: anúncio que some do site é
+// apagado por DeleteStaleListings, então toda linha presente é ativa.
+const selectPropertyListingsSQL = `
+SELECT id, source_domain, listing_url, price_raw, last_seen_at
+FROM listings
+WHERE property_id = $1::uuid
+ORDER BY id`
 
 // updatePropertySQL reescreve os campos consolidados. Não toca em
 // active_listing_count (mantido pelo par link/unlink) nem em created_at, e seta
@@ -385,6 +412,102 @@ func GetPropertyByID(ctx context.Context, pool *pgxpool.Pool, id string) (*Prope
 	}
 
 	return &property, nil
+}
+
+// GetPropertyWithListings devolve o imóvel canônico e todos os anúncios
+// vinculados a ele, para a tela de comparação de preços entre portais.
+//
+// São **exatamente duas queries**, independentemente da quantidade de anúncios:
+// o imóvel e a lista. Não é um JOIN de propósito — ele repetiria os TEXT[] de
+// amenities/photos em cada linha e obrigaria a desduplicar em Go, e uma query
+// por anúncio (N+1) é o que esta função existe para impedir.
+//
+// Id inexistente **não** é erro: retorna (nil, nil), mesmo contrato de
+// GetPropertyByID — quem chama traduz isso para 404. Id em branco ou não
+// conversível para uuid é ErrInvalidPropertyID. Imóvel sem anúncios devolve
+// Listings como slice vazia, nunca nil, e não é ausência.
+func GetPropertyWithListings(ctx context.Context, pool *pgxpool.Pool, id string) (*PropertyDetail, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		// Sai antes de ir ao banco: o path /api/v1/properties/ e um id só com
+		// espaços chegam aqui e não têm o que consultar.
+		return nil, fmt.Errorf("db: get property with listings: %w", ErrInvalidPropertyID)
+	}
+
+	property, err := GetPropertyByID(ctx, pool, id)
+	if err != nil {
+		if isInvalidTextRepresentation(err) {
+			return nil, fmt.Errorf("db: get property with listings %q: %w", id, ErrInvalidPropertyID)
+		}
+		return nil, fmt.Errorf("db: get property with listings %q: %w", id, err)
+	}
+	if property == nil {
+		return nil, nil
+	}
+
+	listings, err := listPropertyListings(ctx, pool, id)
+	if err != nil {
+		return nil, err
+	}
+
+	return &PropertyDetail{Property: *property, Listings: listings}, nil
+}
+
+func listPropertyListings(ctx context.Context, pool *pgxpool.Pool, propertyID string) ([]PropertyListing, error) {
+	rows, err := pool.Query(ctx, selectPropertyListingsSQL, propertyID)
+	if err != nil {
+		return nil, fmt.Errorf("db: list listings for property %q: %w", propertyID, err)
+	}
+	defer rows.Close()
+
+	listings := make([]PropertyListing, 0, 8)
+	for rows.Next() {
+		listing, err := scanPropertyListing(rows)
+		if err != nil {
+			return nil, fmt.Errorf("db: list listings for property %q: %w", propertyID, err)
+		}
+		listings = append(listings, listing)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: list listings for property %q: %w", propertyID, err)
+	}
+
+	return listings, nil
+}
+
+// scanPropertyListing lê uma linha na ordem de selectPropertyListingsSQL.
+// price_raw é nullable e passa por um *string temporário: pgx não escaneia NULL
+// para string, e aqui NULL e "" são a mesma coisa.
+func scanPropertyListing(row pgx.Row) (PropertyListing, error) {
+	var (
+		listing  PropertyListing
+		priceRaw *string
+	)
+	err := row.Scan(
+		&listing.ID,
+		&listing.SourceDomain,
+		&listing.ListingURL,
+		&priceRaw,
+		&listing.LastSeenAt,
+	)
+	if err != nil {
+		return PropertyListing{}, err
+	}
+
+	if priceRaw != nil {
+		listing.PriceRaw = *priceRaw
+	}
+
+	return listing, nil
+}
+
+// isInvalidTextRepresentation reconhece o SQLSTATE 22P02 em qualquer ponto da
+// cadeia de erros. A tradução acontece **só** em GetPropertyWithListings: as
+// demais funções mantêm o contrato atual, porque grouping/enrichqueue já lidam
+// com os erros delas e nunca recebem id vindo de uma query string.
+func isInvalidTextRepresentation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == pgInvalidTextRepresentation
 }
 
 // UpdateProperty reescreve os campos consolidados do imóvel identificado por

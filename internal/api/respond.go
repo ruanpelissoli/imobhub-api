@@ -17,6 +17,7 @@ const (
 	msgInternalError = "internal server error"
 	msgNotFound      = "not found"
 	msgNotAllowed    = "method not allowed"
+	msgInvalidID     = "id inválido"
 )
 
 // errorBody é o envelope de erro do projeto. Todo handler da API responde
