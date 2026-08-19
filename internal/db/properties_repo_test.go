@@ -588,6 +588,13 @@ func TestNormalizePropertyPagination(t *testing.T) {
 		{name: "o teto exato passa", page: 2, pageSize: 50, wantLimit: 50, wantOffset: 50},
 		{name: "offset é (page-1) * pageSize", page: 3, pageSize: 20, wantLimit: 20, wantOffset: 40},
 		{name: "página além do fim continua sendo um offset válido", page: 1000, pageSize: 20, wantLimit: 20, wantOffset: 19980},
+		{
+			name:       "offset nunca fica negativo por overflow",
+			page:       math.MaxInt64,
+			pageSize:   maxPropertyPageSize,
+			wantLimit:  maxPropertyPageSize,
+			wantOffset: (maxPropertyPage - 1) * maxPropertyPageSize,
+		},
 	}
 
 	for _, tt := range tests {
@@ -598,6 +605,46 @@ func TestNormalizePropertyPagination(t *testing.T) {
 			}
 			if offset != tt.wantOffset {
 				t.Errorf("offset = %d, want %d", offset, tt.wantOffset)
+			}
+		})
+	}
+}
+
+func TestEffectivePropertyPagination(t *testing.T) {
+	// São os números que a API ecoa no envelope de paginação e usa na chave de
+	// cache: mudar o default ou o teto aqui muda os dois lá — é por isso que a
+	// função é exportada em vez de replicada em internal/api.
+	tests := []struct {
+		name         string
+		page         int
+		pageSize     int
+		wantPage     int
+		wantPageSize int
+	}{
+		{name: "zerado cai no default", page: 0, pageSize: 0, wantPage: 1, wantPageSize: defaultPropertyPageSize},
+		{name: "negativos caem no default", page: -3, pageSize: -1, wantPage: 1, wantPageSize: defaultPropertyPageSize},
+		{name: "acima do teto é cortado", page: 2, pageSize: 999, wantPage: 2, wantPageSize: maxPropertyPageSize},
+		{name: "o teto exato passa", page: 2, pageSize: maxPropertyPageSize, wantPage: 2, wantPageSize: maxPropertyPageSize},
+		{name: "valores válidos passam intactos", page: 3, pageSize: 10, wantPage: 3, wantPageSize: 10},
+		{
+			// Sem o teto, (page-1)*pageSize daria a volta no int e o PostgreSQL
+			// rejeitaria um OFFSET negativo: 500 numa página só vazia.
+			name:         "página absurda é cortada antes de estourar o OFFSET",
+			page:         math.MaxInt64,
+			pageSize:     maxPropertyPageSize,
+			wantPage:     maxPropertyPage,
+			wantPageSize: maxPropertyPageSize,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			page, pageSize := EffectivePropertyPagination(tt.page, tt.pageSize)
+			if page != tt.wantPage {
+				t.Errorf("page = %d, want %d", page, tt.wantPage)
+			}
+			if pageSize != tt.wantPageSize {
+				t.Errorf("pageSize = %d, want %d", pageSize, tt.wantPageSize)
 			}
 		})
 	}

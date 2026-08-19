@@ -229,6 +229,11 @@ ORDER BY created_at DESC, id DESC`
 const (
 	defaultPropertyPageSize = 20
 	maxPropertyPageSize     = 50
+
+	// maxPropertyPage existe só para o OFFSET não estourar o int: `?page=1e18`
+	// faria (page-1)*pageSize dar a volta e o PostgreSQL rejeitar um OFFSET
+	// negativo, virando 500 numa página que deveria ser simplesmente vazia.
+	maxPropertyPage = 1_000_000
 )
 
 // SearchProperties devolve uma página de imóveis canônicos filtrada por params,
@@ -337,12 +342,21 @@ func buildPropertySearchQuery(params PropertySearchParams) (string, []any) {
 	return "\nWHERE " + strings.Join(conditions, "\n  AND "), args
 }
 
-// normalizePropertyPagination converte Page/PageSize em LIMIT/OFFSET. Normaliza
-// em vez de rejeitar: os valores vêm de uma query string, e devolver a primeira
-// página é uma resposta mais útil que um erro de validação para `?page=0`.
-func normalizePropertyPagination(page, pageSize int) (limit, offset int) {
-	if page <= 0 {
+// EffectivePropertyPagination devolve a página e o tamanho de página realmente
+// usados por SearchProperties. Normaliza em vez de rejeitar: os valores vêm de
+// uma query string, e devolver a primeira página é uma resposta mais útil que um
+// erro de validação para `?page=0`.
+//
+// É exportada porque a API precisa **exatamente** desses números — para ecoá-los
+// no envelope de paginação e para compor a chave de cache. Replicar as
+// constantes em internal/api faria a resposta anunciar 20 no dia em que o teto
+// aqui mudasse, sem nada quebrar.
+func EffectivePropertyPagination(page, pageSize int) (int, int) {
+	switch {
+	case page <= 0:
 		page = 1
+	case page > maxPropertyPage:
+		page = maxPropertyPage
 	}
 	switch {
 	case pageSize <= 0:
@@ -351,6 +365,11 @@ func normalizePropertyPagination(page, pageSize int) (limit, offset int) {
 		pageSize = maxPropertyPageSize
 	}
 
+	return page, pageSize
+}
+
+func normalizePropertyPagination(page, pageSize int) (limit, offset int) {
+	page, pageSize = EffectivePropertyPagination(page, pageSize)
 	return pageSize, (page - 1) * pageSize
 }
 

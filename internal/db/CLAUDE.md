@@ -175,7 +175,15 @@ compartilhado com `ai`, `selectors` e `scraper` — nenhum outro pacote monta SQ
 - **`Page`/`PageSize` são normalizados, não validados** (`Page <= 0` → 1,
   `PageSize <= 0` → 20, `> 50` → 50). Os valores vêm de query string: devolver a
   primeira página é mais útil que um erro para `?page=0`. O teto de 50 também
-  limita o quanto o `OFFSET` pode custar.
+  limita o quanto o `OFFSET` pode custar. `Page > 1_000_000` também é cortado,
+  por um motivo diferente dos outros: `(page-1)*pageSize` daria a volta no `int`
+  e o PostgreSQL rejeitaria um `OFFSET` negativo — 500 numa página que deveria
+  ser simplesmente vazia.
+- **`EffectivePropertyPagination` é exportada e é a fonte única desses números.**
+  `internal/api` precisa **exatamente** deles para ecoar `page`/`page_size` no
+  envelope da resposta e para compor a chave de cache da busca. Replicar as
+  constantes lá faria a API anunciar 20 no dia em que o teto mudasse aqui, sem
+  nada quebrar. `normalizePropertyPagination` (LIMIT/OFFSET) delega a ela.
 - **`PropertySearchParams` usa valores, não ponteiros** — o oposto de
   `Property`. Ali `nil` é "não consolidado"; aqui zero-value é "filtro não
   aplicado", e "filtrar por exatamente zero quartos" não é um pedido possível

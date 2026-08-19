@@ -61,7 +61,9 @@ stdlib (nenhum `chi`/`gorilla` no `go.mod`); o porquê está em
 `config` e `cache` são folhas do grafo — não importam nada do projeto. `cache`
 recebe a `REDIS_URL` por parâmetro (de `cfg.RedisURL`, em `main`) justamente
 para continuar assim, e entrega **só** o `*redis.Client` validado por `Ping`:
-set/get, TTL e desenho de chaves ficam em quem consumir o cache.
+set/get, TTL e desenho de chaves ficam em quem consumir o cache. O primeiro
+consumidor é `api`, na busca de imóveis — chave, TTL e política de fallback
+estão documentados em `internal/api/CLAUDE.md`, não aqui.
 
 `enrichment` **era** folha e deixou de ser com o geocoder: ele fala com o
 Nominatim e reusa `ratelimit.DomainLimiter` (espaçamento fixo por host, sem
@@ -119,12 +121,18 @@ comodidades do `TermExtractor` chega por parâmetro de construtor (de
 - `api/` é o servidor HTTP: roteador com o grupo `/api/v1`, `/health` de
   liveness fora do grupo, middlewares de recovery/logging/CORS e a conversão dos
   404/405 do `ServeMux` para o envelope `{"error":"..."}`. Esse envelope é
-  convenção do projeto para toda resposta de erro. A primeira rota de negócio é
-  `GET /api/v1/properties/{id}` (`properties_handler.go`): imóvel canônico +
-  anúncios vinculados, **sem Redis** e em duas queries fixas
-  (`db.GetPropertyWithListings`). O ponto de extensão continua sendo
-  `registerV1Routes`, e o DTO do imóvel (`propertyResponse`) é **um só** — as
-  rotas seguintes reusam, não recriam.
+  convenção do projeto para toda resposta de erro. Duas rotas de negócio:
+  `GET /api/v1/properties/{id}` (`properties_handler.go`) devolve o imóvel
+  canônico + anúncios vinculados, **sem Redis** e em duas queries fixas
+  (`db.GetPropertyWithListings`); `GET /api/v1/properties`
+  (`properties_search_handler.go`) é a busca paginada sobre
+  `db.SearchProperties`, com cache Redis de 5 min cujo erro degrada para o banco.
+  O ponto de extensão continua sendo `registerV1Routes` (registrar fora dele
+  ignora a cadeia de middlewares), e o DTO do imóvel (`propertyResponse`) é **um
+  só** — as rotas seguintes reusam, não recriam. O acesso a dados e ao Redis da
+  busca entra por seams declarados **no próprio `api`** (`propertySearcher`,
+  `cacheStore`), como `grouping` faz — é o que mantém os testes dela sem Postgres
+  e sem Redis.
 - Logs operacionais usam `log/slog` (handler JSON configurado em `main`). Não
   usar `fmt.Println`/`log.Printf`: quebra o parsing dos logs em produção.
 - Erros são embrulhados com `fmt.Errorf("pacote: ... %w", err)` e sempre citam o

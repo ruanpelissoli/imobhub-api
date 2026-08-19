@@ -40,3 +40,19 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, errorBody{Error: message})
 }
+
+// writeJSONBytes escreve um corpo já serializado. Existe para o caminho em que
+// os mesmos bytes vão para a resposta e para o cache: writeJSON usaria um
+// json.Encoder, que acrescenta "\n", e o corpo de um cache hit deixaria de ser
+// byte a byte igual ao de um miss.
+//
+// O Content-Type é setado antes do WriteHeader, como todo handler do projeto —
+// é o discriminador de que jsonErrors depende.
+func writeJSONBytes(w http.ResponseWriter, status int, body []byte) {
+	w.Header().Set(contentTypeHeader, contentTypeJSON)
+	w.WriteHeader(status)
+
+	if _, err := w.Write(body); err != nil {
+		slog.Error("api: failed to write response body", "error", err)
+	}
+}

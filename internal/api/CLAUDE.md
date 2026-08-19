@@ -2,8 +2,10 @@
 
 ## Purpose
 Monta o servidor HTTP: roteador (`/api/v1` + `/health`), os middlewares base
-(recovery, logging, CORS, envelope JSON de erro) e o ciclo de vida do
-`http.Server` (timeouts + shutdown gracioso). `cmd/api` só orquestra o boot.
+(recovery, logging, CORS, envelope JSON de erro), o ciclo de vida do
+`http.Server` (timeouts + shutdown gracioso) e os handlers de negócio — hoje
+`GET /api/v1/properties` (busca paginada com cache Redis). `cmd/api` só
+orquestra o boot.
 
 ## Key decisions
 - **Roteador é o `net/http.ServeMux` da stdlib, não `chi`.** Desde o Go 1.22 o
@@ -48,14 +50,74 @@ Monta o servidor HTTP: roteador (`/api/v1` + `/health`), os middlewares base
   sinal — passá-lo abortaria o shutdown na hora, o oposto de deixar as
   requisições em voo terminarem.
 
-## Rotas de negócio (`properties_handler.go`)
-- **`GET /api/v1/properties/{id}` é a primeira rota de negócio**, e é a tela de
-  comparação entre portais: o imóvel canônico mais **todos** os anúncios
-  vinculados, cada um com seu preço e a URL de origem.
-- **`propertyResponse` é O DTO do imóvel.** Toda rota futura que devolver imóvel
-  (busca, listagem, geo) monta esse mesmo struct — dois mapeamentos JSON para a
+## `GET /api/v1/properties` — busca (`properties_search_handler.go`, `properties_cache.go`)
+- **A busca reusa `propertyResponse`, o DTO do imóvel**, embutindo-o em
+  `propertyListItem` — mesma técnica de `propertyDetailResponse`. Um DTO próprio
+  para a listagem entregaria `bedroom_count` numa rota e `bedrooms` na outra para
+  a mesma entidade, que é exatamente o que a decisão do detalhe evita.
+- **`active_listing_count` só aparece na busca.** O detalhe o omite de propósito
+  (contador denormalizado ao lado de `listings` vira contradição visível); a
+  listagem não tem lista de anúncios com que contradizer, e "3 anúncios" é o que
+  faz o usuário abrir o imóvel. Por isso ele mora em `propertyListItem`, não em
+  `propertyResponse`. `updated_at`, ao contrário, é campo da entidade e ficou no
+  DTO compartilhado — pô-lo só na listagem seria a divergência que a regra do DTO
+  único proíbe.
+- **`data` nunca é `null`**, mesmo sem resultados (`[]`): o front não deveria ter
+  que tratar dois formatos para "lista vazia". Vale o mesmo para
+  `amenities`/`photos`, via `emptyIfNil`.
+- **Validação de formato aqui, normalização de faixa no repositório.** O handler
+  rejeita com 400 o que não é número (`page=abc`) e o que é negativo num
+  **filtro** (`min_bedrooms=-1`, `min_area=-2`). `page`/`page_size` fora da faixa
+  **não** são 400: `db.EffectivePropertyPagination` normaliza
+  (`page<=0`→1, `page_size<=0`→20, `>50`→50, `page>1e6`→1e6) e a resposta ecoa os
+  valores **efetivos**. É decisão registrada em `internal/db/CLAUDE.md`:
+  devolver a primeira página é mais útil que um erro para `?page=0`. Corolário:
+  `page=-2` é normalizado, não rejeitado.
+- **A paginação efetiva vem de `db.EffectivePropertyPagination`, nunca replicada
+  aqui.** O envelope e a chave de cache precisam exatamente dos números que o
+  `LIMIT/OFFSET` usou; copiar as constantes faria a API anunciar 20 no dia em que
+  o teto mudasse no repositório, sem nada quebrar.
+- **`min_price`/`max_price` presentes → 400**, não ignorados em silêncio.
+  `properties` não tem coluna de preço; ignorá-los devolveria o catálogo inteiro
+  **parecendo** filtrado por preço, que é o pior resultado possível para o front.
+  Eles nascem junto da migration que criar a coluna normalizada.
+- **Chave de cache: `properties:search:v1:<sha256 dos params normalizados>`.** O
+  `v1` versiona o **formato do payload**, não a API: mudar o DTO sem trocá-lo
+  serviria o shape antigo por até um TTL inteiro para clientes que já esperam o
+  novo. Normalização antes do hash — trim nas strings, paginação efetiva, e
+  amenities sem vazios, deduplicadas e **ordenadas** — é o que faz
+  `?amenities=a,b` e `?amenities=b,a&amenities=b` compartilharem a entrada. O
+  hash tem tamanho fixo, então nenhum valor do usuário vaza para dentro da chave.
+- **TTL de 5 min é constante do pacote, não variável de ambiente**, porque
+  `internal/api` não importa `internal/config` (ver Dependencies).
+- **O que vai para o Redis é o corpo do 200 já serializado**, não `[]db.Property`:
+  é o que garante que hit e miss respondam byte a byte igual. Por isso o caminho
+  de sucesso usa `json.Marshal` + `writeJSONBytes`, e não `writeJSON` (o
+  `json.Encoder` acrescenta `\n`).
+- **Só 200 é cacheado.** Um 400 ou 500 gravado serviria o erro por um TTL inteiro.
+- **Falha de Redis é transparente:** indisponibilidade, timeout ou valor ilegível
+  (`json.Valid` falha) viram `logger.Warn` + miss, e a requisição responde 200
+  pelo banco. Nunca 500. `deps.Redis == nil` é o mesmo caminho — é assim que os
+  testes do pacote rodam sem Redis.
+- **`propertyCacheOpTimeout` de 200ms, derivado de `r.Context()`.** Sem ele um
+  Redis lento consumiria o `WriteTimeout` de 30s do servidor e o cache passaria a
+  piorar exatamente a latência que existe para melhorar.
+- **`X-Cache: HIT|MISS` em toda resposta 200**, e o `cors` emite
+  `Access-Control-Expose-Headers: X-Cache` para origens permitidas — sem isso o
+  browser esconde o header e o front não consegue nem medir o hit rate.
+- **Seams declarados no consumidor** (`propertySearcher`, `cacheStore`), mesmo
+  padrão de `grouping.PropertyStore`: o wiring de produção fecha sobre
+  `deps.Pool`/`deps.Redis` em `registerV1Routes` e os testes injetam closures e um
+  fake, sem Postgres nem Redis.
+
+## `GET /api/v1/properties/{id}` — detalhe (`properties_handler.go`)
+- **É a tela de comparação entre portais**: o imóvel canônico mais **todos** os
+  anúncios vinculados, cada um com seu preço e a URL de origem.
+- **`propertyResponse` é O DTO do imóvel.** Toda rota que devolver imóvel
+  (detalhe, busca, geo) monta esse mesmo struct — dois mapeamentos JSON para a
   mesma entidade divergiriam no primeiro campo novo. `newPropertyDetailResponse`
-  é pura de propósito: é ela que os testes cobrem sem banco.
+  é pura de propósito: é ela que os testes cobrem sem banco. Campo novo do imóvel
+  entra **nele**, não num struct por rota.
 - **Nenhum acesso ao Redis neste endpoint**, nem leitura nem escrita, e é
   decisão, não esquecimento: servir preço obsoleto numa tela cujo propósito é
   comparar preços é o pior defeito possível dela. Duas queries por requisição é
@@ -80,11 +142,9 @@ Monta o servidor HTTP: roteador (`/api/v1` + `/health`), os middlewares base
 - **`{id}` e `{$}` são registrados juntos.** `/api/v1/properties/` não casa com
   `{id}` (o wildcard exige segmento não-vazio) e cairia no 404 genérico do mux,
   quando o correto é `400` — o cliente mandou um id, ele é que está em branco.
-  **Efeito colateral pinado em teste:** registrar o padrão de subtree faz o mux
-  responder `301` em `GET /api/v1/properties` (sem barra) enquanto a rota de
-  busca não existir. É transitório — quando o padrão exato entrar, ele ganha —,
-  mas navegadores cacheiam 301: quem for implementar a busca deve atualizar
-  `TestPropertiesWithoutTrailingSlashRedirects` junto.
+  O `301` que o mux emitia em `GET /api/v1/properties` (sem barra) por causa
+  desses padrões **acabou**: o padrão exato da busca tem precedência e ganha dele.
+  `TestPropertiesWithoutTrailingSlashIsTheSearchRoute` é o teste que pina isso.
 - **Id malformado é `400`, não `500`.** A validação não é feita em Go: o handler
   reage a `db.ErrInvalidPropertyID`, que é a tradução do SQLSTATE `22P02` do
   PostgreSQL (ver `internal/db/CLAUDE.md` para o porquê de não validar formato
@@ -129,3 +189,14 @@ por `cmd/api`.
   outra.
 - `WriteTimeout` de 30s pode ficar curto para listagens grandes — revisar junto
   com a task de paginação.
+- **`newPropertyCache(nil)` devolve `nil` de propósito.** Guardar um
+  `*redis.Client` nil dentro da interface `cacheStore` produziria uma interface
+  **não-nil** e um panic na primeira operação. A checagem de nil mora no wiring,
+  antes da atribuição; um `*propertyCache` nil é o caminho "sem cache".
+- **Os testes de `NewRouter` montam `Deps` com `Pool` nil.** A rota de properties
+  agora está registrada, mas nenhum deles a chama de verdade — um
+  `GET /api/v1/properties` com pool nil entraria em panic e viraria 500 pelo
+  `recovery`.
+- **Mudou o shape do DTO de resposta? Troque o `v1` da chave de cache.** Sem
+  isso, entradas gravadas com o formato antigo continuam sendo servidas por até
+  5 minutos.

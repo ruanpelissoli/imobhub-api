@@ -39,6 +39,7 @@ type propertyResponse struct {
 	Latitude         *float64 `json:"latitude"`
 	Longitude        *float64 `json:"longitude"`
 	CreatedAt        string   `json:"created_at"`
+	UpdatedAt        string   `json:"updated_at"`
 }
 
 // listingResponse é um anúncio na tela de comparação entre portais.
@@ -143,6 +144,7 @@ func newPropertyResponse(property db.Property) propertyResponse {
 		Latitude:         property.Lat,
 		Longitude:        property.Lng,
 		CreatedAt:        formatTimestamp(property.CreatedAt),
+		UpdatedAt:        formatTimestamp(property.UpdatedAt),
 	}
 }
 

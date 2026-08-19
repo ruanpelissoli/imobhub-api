@@ -232,20 +232,20 @@ func TestGetPropertyRejectsBlankID(t *testing.T) {
 	}
 }
 
-func TestPropertiesWithoutTrailingSlashRedirects(t *testing.T) {
-	// Comportamento **pinado**, não desejado: registrar ".../properties/{$}"
-	// faz o ServeMux emitir o redirect implícito de subtree para
-	// "/api/v1/properties" enquanto a rota de busca não existir. Quando ela
-	// entrar (padrão exato "GET /api/v1/properties"), ela ganha do redirect e
-	// este teste deve ser atualizado junto.
+func TestPropertiesWithoutTrailingSlashIsTheSearchRoute(t *testing.T) {
+	// Substitui TestPropertiesWithoutTrailingSlashRedirects: o 301 implícito que
+	// ".../properties/{$}" provocava era transitório e valia só enquanto a busca
+	// não existisse. Com o padrão exato registrado, ele ganha do redirect — o que
+	// importa pinar agora é que "/api/v1/properties" **não** redireciona mais
+	// (navegadores cacheiam 301) e não cai no 404 do mux.
 	rec := httptest.NewRecorder()
 	NewRouter(Deps{Logger: discardLogger()}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/properties", nil))
 
-	if rec.Code != http.StatusMovedPermanently {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMovedPermanently)
+	if rec.Code == http.StatusMovedPermanently || rec.Code == http.StatusNotFound {
+		t.Fatalf("status = %d, want a busca respondendo (nem 301, nem 404)", rec.Code)
 	}
-	if got, want := rec.Header().Get("Location"), "/api/v1/properties/"; got != want {
-		t.Errorf("Location = %q, want %q", got, want)
+	if got := rec.Header().Get("Location"); got != "" {
+		t.Errorf("Location = %q, want vazio — a busca não redireciona", got)
 	}
 }
 
