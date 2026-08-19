@@ -21,6 +21,9 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	t.Setenv(envScraperUserAgent, "")
 	t.Setenv(envScraperRateLimit, "")
 	t.Setenv(envAmenitiesFile, "")
+	t.Setenv(envGroupingConfidenceThreshold, "")
+	t.Setenv(envGroupingRadiusMeters, "")
+	t.Setenv(envGroupingMaxCandidates, "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -50,6 +53,89 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	}
 	if cfg.AmenitiesFile != DefaultAmenitiesFile {
 		t.Errorf("AmenitiesFile = %q, want %q", cfg.AmenitiesFile, DefaultAmenitiesFile)
+	}
+	if cfg.GroupingConfidenceThreshold != DefaultGroupingConfidenceThreshold {
+		t.Errorf("GroupingConfidenceThreshold = %v, want %v", cfg.GroupingConfidenceThreshold, DefaultGroupingConfidenceThreshold)
+	}
+	if cfg.GroupingRadiusMeters != DefaultGroupingRadiusMeters {
+		t.Errorf("GroupingRadiusMeters = %d, want %d", cfg.GroupingRadiusMeters, DefaultGroupingRadiusMeters)
+	}
+	if cfg.GroupingMaxCandidates != DefaultGroupingMaxCandidates {
+		t.Errorf("GroupingMaxCandidates = %d, want %d", cfg.GroupingMaxCandidates, DefaultGroupingMaxCandidates)
+	}
+}
+
+func TestLoadReadsGroupingOverrides(t *testing.T) {
+	setRequired(t)
+	t.Setenv(envGroupingConfidenceThreshold, "  0.7  ") // espaços devem ser removidos
+	t.Setenv(envGroupingRadiusMeters, "250")
+	t.Setenv(envGroupingMaxCandidates, "3")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+
+	if cfg.GroupingConfidenceThreshold != 0.7 {
+		t.Errorf("GroupingConfidenceThreshold = %v, want 0.7", cfg.GroupingConfidenceThreshold)
+	}
+	if cfg.GroupingRadiusMeters != 250 {
+		t.Errorf("GroupingRadiusMeters = %d, want 250", cfg.GroupingRadiusMeters)
+	}
+	if cfg.GroupingMaxCandidates != 3 {
+		t.Errorf("GroupingMaxCandidates = %d, want 3", cfg.GroupingMaxCandidates)
+	}
+}
+
+// As bordas de [0,1] são valores válidos: 0 aceita qualquer match do modelo e
+// 1 exige certeza. Ambos são configurações legítimas de calibração.
+func TestLoadAcceptsThresholdAtTheBounds(t *testing.T) {
+	for _, raw := range []string{"0", "1"} {
+		t.Run(raw, func(t *testing.T) {
+			setRequired(t)
+			t.Setenv(envGroupingConfidenceThreshold, raw)
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() with %s=%q error = %v, want nil", envGroupingConfidenceThreshold, raw, err)
+			}
+		})
+	}
+}
+
+// Valor inválido é erro de boot citando o valor recebido, nunca fallback
+// silencioso: um threshold errado produz duplicatas (ou fusões) em silêncio
+// pela coleta inteira.
+func TestLoadRejectsInvalidGroupingValues(t *testing.T) {
+	tests := []struct {
+		envName string
+		raw     string
+	}{
+		{envGroupingConfidenceThreshold, "-0.1"},
+		{envGroupingConfidenceThreshold, "1.5"},
+		{envGroupingConfidenceThreshold, "alto"},
+		{envGroupingRadiusMeters, "0"},
+		{envGroupingRadiusMeters, "-5"},
+		{envGroupingRadiusMeters, "cem"},
+		{envGroupingMaxCandidates, "0"},
+		{envGroupingMaxCandidates, "-1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.envName+"="+tt.raw, func(t *testing.T) {
+			setRequired(t)
+			t.Setenv(tt.envName, tt.raw)
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() with %s=%q error = nil, want error", tt.envName, tt.raw)
+			}
+			if !strings.Contains(err.Error(), tt.envName) {
+				t.Errorf("error %q does not mention %q", err, tt.envName)
+			}
+			if !strings.Contains(err.Error(), tt.raw) {
+				t.Errorf("error %q does not report the received value %q", err, tt.raw)
+			}
+		})
 	}
 }
 
