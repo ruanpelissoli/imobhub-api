@@ -19,7 +19,13 @@ ambiente diretamente.
   `AMENITIES_FILE` (`configs/amenities.yaml` — vocabulário de comodidades de
   `internal/enrichment`), `GROUPING_CONFIDENCE_THRESHOLD` (`0.85`),
   `GROUPING_RADIUS_METERS` (`100`) e `GROUPING_MAX_CANDIDATES` (`5`), lidas por
-  `internal/grouping`.
+  `internal/grouping`, e `ENRICHMENT_WORKERS` (`4`), lida por
+  `internal/enrichqueue`.
+- **`ENRICHMENT_WORKERS` também passa por `parsePositiveInt`, então zero é
+  erro.** Uma fila com zero workers nunca processa nada e parece "funcionando"
+  nos logs — o mesmo sintoma silencioso de raio/candidatos zerados. O default 4
+  é conservador de propósito: a geocodificação serializa em 1 req/s global, e
+  subir esse número só paraleliza as chamadas **pagas** de IA do agrupamento.
 - **As três variáveis de agrupamento são validadas no boot, sem fallback
   silencioso.** Threshold fora de `[0,1]`, raio `<= 0` ou candidatos `<= 0` são
   erro, citando o valor recebido. Motivo: um threshold de `8.5` (vírgula no

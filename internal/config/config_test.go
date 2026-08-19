@@ -24,6 +24,7 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	t.Setenv(envGroupingConfidenceThreshold, "")
 	t.Setenv(envGroupingRadiusMeters, "")
 	t.Setenv(envGroupingMaxCandidates, "")
+	t.Setenv(envEnrichmentWorkers, "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -62,6 +63,45 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	}
 	if cfg.GroupingMaxCandidates != DefaultGroupingMaxCandidates {
 		t.Errorf("GroupingMaxCandidates = %d, want %d", cfg.GroupingMaxCandidates, DefaultGroupingMaxCandidates)
+	}
+	if cfg.EnrichmentWorkers != DefaultEnrichmentWorkers {
+		t.Errorf("EnrichmentWorkers = %d, want %d", cfg.EnrichmentWorkers, DefaultEnrichmentWorkers)
+	}
+}
+
+func TestLoadReadsEnrichmentWorkers(t *testing.T) {
+	setRequired(t)
+	t.Setenv(envEnrichmentWorkers, "  8  ") // espaços devem ser removidos
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+
+	if cfg.EnrichmentWorkers != 8 {
+		t.Errorf("EnrichmentWorkers = %d, want 8", cfg.EnrichmentWorkers)
+	}
+}
+
+// Zero worker é uma fila que nunca processa nada e que parece "funcionando" nos
+// logs; por isso é erro de boot, como raio e candidatos do agrupamento.
+func TestLoadRejectsInvalidEnrichmentWorkers(t *testing.T) {
+	for _, raw := range []string{"0", "-2", "quatro"} {
+		t.Run(raw, func(t *testing.T) {
+			setRequired(t)
+			t.Setenv(envEnrichmentWorkers, raw)
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() with %s=%q error = nil, want error", envEnrichmentWorkers, raw)
+			}
+			if !strings.Contains(err.Error(), envEnrichmentWorkers) {
+				t.Errorf("error %q does not mention %q", err, envEnrichmentWorkers)
+			}
+			if !strings.Contains(err.Error(), raw) {
+				t.Errorf("error %q does not report the received value %q", err, raw)
+			}
+		})
 	}
 }
 

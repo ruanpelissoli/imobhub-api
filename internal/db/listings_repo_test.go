@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -263,4 +265,176 @@ func TestEncodeExtraDataDefaultsToEmptyObject(t *testing.T) {
 			t.Errorf("encodeExtraData(%v) = %q, want %q", data, got, want)
 		}
 	}
+}
+
+func TestListingEnrichmentArgsOrderAndNulls(t *testing.T) {
+	neighborhood := "Jardim Botânico"
+	bedrooms := 3
+	lat, lng := -15.78, -47.93
+
+	args := listingEnrichmentArgs(ListingEnrichment{
+		ID:                     42,
+		NormalizedNeighborhood: &neighborhood,
+		BedroomCount:           &bedrooms,
+		Amenities:              []string{"piscina", "elevador"},
+		Lat:                    &lat,
+		Lng:                    &lng,
+	})
+
+	// A ordem é o contrato com os placeholders de updateListingEnrichmentSQL.
+	if got, want := len(args), 6; got != want {
+		t.Fatalf("len(args) = %d, want %d", got, want)
+	}
+	if got, want := args[0], int64(42); got != want {
+		t.Errorf("args[0] (id) = %v, want %v", got, want)
+	}
+	if got, want := args[1], &neighborhood; got != want {
+		t.Errorf("args[1] (normalized_neighborhood) = %v, want %v", got, want)
+	}
+	if got, want := args[2], &bedrooms; got != want {
+		t.Errorf("args[2] (bedroom_count) = %v, want %v", got, want)
+	}
+	if got, want := args[3], []string{"piscina", "elevador"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("args[3] (amenities) = %v, want %v", got, want)
+	}
+	if got, want := args[4], &lat; got != want {
+		t.Errorf("args[4] (lat) = %v, want %v", got, want)
+	}
+	if got, want := args[5], &lng; got != want {
+		t.Errorf("args[5] (lng) = %v, want %v", got, want)
+	}
+}
+
+func TestListingEnrichmentArgsKeepsNilPointersAsNull(t *testing.T) {
+	// nil precisa chegar ao banco como NULL: é a distinção que o struct existe
+	// para preservar ("não reconhecido" != "reconhecido como vazio/zero").
+	args := listingEnrichmentArgs(ListingEnrichment{ID: 7})
+
+	for i, name := range map[int]string{1: "normalized_neighborhood", 2: "bedroom_count", 4: "lat", 5: "lng"} {
+		if !reflect.ValueOf(args[i]).IsNil() {
+			t.Errorf("args[%d] (%s) = %v, want nil", i, name, args[i])
+		}
+	}
+
+	// amenities segue a regra oposta, a mesma de image_urls: nil vira array
+	// vazio, nunca NULL.
+	if got, want := args[3], []string{}; !reflect.DeepEqual(got, want) {
+		t.Errorf("args[3] (amenities) = %v, want %v", got, want)
+	}
+}
+
+func TestUpdateListingEnrichmentRejectsMissingID(t *testing.T) {
+	// A guarda precisa retornar **antes** de tocar o pool — com pool nil,
+	// qualquer ida ao banco seria um panic.
+	if err := UpdateListingEnrichment(context.Background(), nil, ListingEnrichment{}); err == nil {
+		t.Fatal("UpdateListingEnrichment() error = nil, want erro de id ausente")
+	}
+	if err := MarkListingEnriched(context.Background(), nil, 0); err == nil {
+		t.Fatal("MarkListingEnriched() error = nil, want erro de id ausente")
+	}
+	if _, err := ListPendingListings(context.Background(), nil, 0, 0); err == nil {
+		t.Fatal("ListPendingListings() com limit 0 error = nil, want erro")
+	}
+}
+
+// Contrato em string, e não comportamento: os dois bugs mais caros desta fila
+// são invisíveis em teste de unidade e só se manifestariam meses depois, como
+// "o catálogo inteiro é reprocessado todo dia" ou "este anúncio nunca sai da
+// fila". Um PostgreSQL real cobre o resto (ver o gotcha de testes deste pacote).
+func TestEnrichmentSQLNeverTouchesUpdatedAt(t *testing.T) {
+	// updated_at é metade do predicado da fila
+	// (enriched_at IS NULL OR updated_at > enriched_at): setá-lo aqui deixaria
+	// o anúncio pendente para sempre, um passe pago de IA por run.
+	for name, sql := range map[string]string{
+		"update enrichment": updateListingEnrichmentSQL,
+		"mark enriched":     markListingEnrichedSQL,
+	} {
+		if strings.Contains(sql, "updated_at") {
+			t.Errorf("%s menciona updated_at; o anúncio nunca sairia da fila:\n%s", name, sql)
+		}
+	}
+}
+
+func TestUpsertListingSQLBumpsUpdatedAtOnlyOnRealChanges(t *testing.T) {
+	// Sem a guarda, todo anúncio visto em toda coleta voltaria à fila de
+	// enriquecimento, mesmo sem nenhuma mudança.
+	if !strings.Contains(upsertListingSQL, "IS DISTINCT FROM") {
+		t.Fatalf("upsertListingSQL não compara os campos com IS DISTINCT FROM:\n%s", upsertListingSQL)
+	}
+
+	for _, column := range []string{
+		"title_raw", "price_raw", "address_raw", "description_raw",
+		"bedrooms_raw", "area_raw", "image_urls", "extra_data",
+	} {
+		guard := "listings." + column + " "
+		if !strings.Contains(upsertListingSQL, guard) {
+			t.Errorf("upsertListingSQL não compara %s com o valor gravado", column)
+		}
+	}
+
+	// last_seen_at responde "o anúncio ainda está no site", não "mudou":
+	// condicioná-lo faria DeleteStaleListings apagar tudo que não mudou.
+	if !strings.Contains(upsertListingSQL, "last_seen_at    = NOW()") {
+		t.Errorf("upsertListingSQL não renova last_seen_at incondicionalmente:\n%s", upsertListingSQL)
+	}
+}
+
+// O índice da fila (migrations/006) é um índice **parcial** cujo predicado
+// precisa ser idêntico ao WHERE de selectPendingListingsSQL: o PostgreSQL só usa
+// um parcial quando consegue provar que o resultado da query satisfaz o
+// predicado do índice, e com expressões iguais essa prova é trivial. Se um dos
+// dois textos mudar sozinho, o índice para de ser usado **em silêncio** — a
+// query continua correta e volta a varrer a tabela inteira, o pior tipo de
+// regressão de performance. Este teste é a única coisa que segura isso sem um
+// PostgreSQL na mão.
+func TestEnrichmentQueueIndexPredicateMatchesTheQuery(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "migrations", "006_fix_enrichment_queue_index.sql"))
+	if err != nil {
+		t.Fatalf("leitura da migration: %v", err)
+	}
+
+	predicate := indexPredicateOf(t, string(raw))
+	if predicate == "" {
+		t.Fatal("não foi possível extrair o predicado do CREATE INDEX da migration 006")
+	}
+
+	// O predicado aparece entre parênteses na query, porque lá ele é combinado
+	// com o cursor por AND.
+	if want := "(" + predicate + ")"; !strings.Contains(collapseSpaces(selectPendingListingsSQL), want) {
+		t.Errorf("o predicado do índice e o da query divergiram; o índice deixará de ser usado.\níndice: %s\nquery:  %s",
+			predicate, collapseSpaces(selectPendingListingsSQL))
+	}
+}
+
+// indexPredicateOf devolve o predicado do CREATE INDEX, já com espaços
+// colapsados. As linhas de comentário são descartadas primeiro: elas citam o
+// predicado antigo e casariam por engano.
+func indexPredicateOf(t *testing.T, migration string) string {
+	t.Helper()
+
+	var statements []string
+	for _, line := range strings.Split(migration, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		statements = append(statements, line)
+	}
+
+	sql := collapseSpaces(strings.Join(statements, " "))
+	_, after, found := strings.Cut(sql, "CREATE INDEX")
+	if !found {
+		return ""
+	}
+	_, predicate, found := strings.Cut(after, " WHERE ")
+	if !found {
+		return ""
+	}
+
+	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(predicate), ";"))
+}
+
+// collapseSpaces reduz qualquer sequência de espaços em branco a um espaço só,
+// para que a comparação não dependa da indentação de cada arquivo.
+func collapseSpaces(sql string) string {
+	return strings.Join(strings.Fields(sql), " ")
 }

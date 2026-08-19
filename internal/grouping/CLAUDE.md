@@ -116,12 +116,16 @@ Três responsabilidades sobre o imóvel canônico, todas em `PropertyGrouper`:
 `internal/config`
 (`GroupingConfidenceThreshold`, `GroupingRadiusMeters`, `GroupingMaxCandidates`).
 
-**Ainda não tem chamador** — nem `GroupListing`, nem `MergePropertyData`, nem
-`HandleListingRemoval`. Como os enrichers de `internal/enrichment`, o serviço
-nasce desconectado: a fila por `enriched_at IS NULL`, a leitura dos anúncios
-pendentes e o wiring em `cmd/scraper` são a task de follow-up **compartilhada** —
-não duplique esse plumbing aqui. Quando ela existir, `MergePropertyData` roda
-**depois** de `GroupListing` (o merge precisa do vínculo já gravado).
+**O chamador de `GroupListing` e `MergePropertyData` é
+`internal/enrichqueue`**, a fila de enriquecimento — e nessa ordem: o merge
+precisa do vínculo já gravado, e os campos derivados do anúncio precisam estar
+**persistidos** antes dele (a consolidação os relê do banco). A fila usa uma
+única instância de `PropertyGrouper` para todos os workers. Não duplique esse
+plumbing aqui.
+
+`HandleListingRemoval` continua sem chamador automático, de propósito: é a porta
+de saída **manual**, para desfazer um agrupamento errado. A limpeza de fim de
+coleta é `db.DeleteStaleListings`.
 
 ## Gotchas
 - **Property órfã.** `createAndLink` faz `CreateProperty` e depois

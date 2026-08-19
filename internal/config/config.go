@@ -41,6 +41,12 @@ const (
 	// comparação. Junto com o raio, é o controle de custo do agrupamento.
 	DefaultGroupingMaxCandidates = 5
 
+	// DefaultEnrichmentWorkers é a concorrência da fila de enriquecimento.
+	// 4 é conservador de propósito: a geocodificação serializa em 1 req/s
+	// global (o DomainLimiter é compartilhado), então subir esse número só
+	// paraleliza as chamadas de IA do agrupamento — que são pagas por anúncio.
+	DefaultEnrichmentWorkers = 4
+
 	envDatabaseURL        = "DATABASE_URL"
 	envAnthropicAPIKey    = "ANTHROPIC_API_KEY"
 	envSourcesFile        = "SOURCES_FILE"
@@ -55,6 +61,8 @@ const (
 	envGroupingConfidenceThreshold = "GROUPING_CONFIDENCE_THRESHOLD"
 	envGroupingRadiusMeters        = "GROUPING_RADIUS_METERS"
 	envGroupingMaxCandidates       = "GROUPING_MAX_CANDIDATES"
+
+	envEnrichmentWorkers = "ENRICHMENT_WORKERS"
 )
 
 // Providers de geocodificação aceitos em GEOCODING_PROVIDER.
@@ -107,6 +115,9 @@ type Config struct {
 	// GroupingMaxCandidates é o número máximo de imóveis enviados ao modelo em
 	// cada comparação.
 	GroupingMaxCandidates int
+	// EnrichmentWorkers é quantos anúncios a fila de enriquecimento processa
+	// simultaneamente (internal/enrichqueue).
+	EnrichmentWorkers int
 }
 
 // ErrMissingRequired indica que uma ou mais variáveis obrigatórias não foram
@@ -177,6 +188,11 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	enrichmentWorkers, err := parsePositiveInt(envEnrichmentWorkers, DefaultEnrichmentWorkers)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		DatabaseURL:        databaseURL,
 		AnthropicAPIKey:    anthropicKey,
@@ -192,6 +208,8 @@ func Load() (*Config, error) {
 		GroupingConfidenceThreshold: groupingThreshold,
 		GroupingRadiusMeters:        groupingRadius,
 		GroupingMaxCandidates:       groupingMaxCandidates,
+
+		EnrichmentWorkers: enrichmentWorkers,
 	}, nil
 }
 
@@ -218,8 +236,9 @@ func parseUnitInterval(envName string, fallback float64) (float64, error) {
 
 // parsePositiveInt lê um inteiro estritamente positivo. Ao contrário de
 // parseRateLimitMS, zero **não** é aceito: raio zero não encontra candidato
-// nenhum e zero candidatos desliga o agrupamento — os dois casos parecem
-// "funcionando" nos logs enquanto criam um imóvel canônico por anúncio.
+// nenhum, zero candidatos desliga o agrupamento e zero workers é uma fila que
+// nunca processa nada — os três casos parecem "funcionando" nos logs enquanto
+// criam um imóvel canônico por anúncio, ou nenhum.
 func parsePositiveInt(envName string, fallback int) (int, error) {
 	raw := lookup(envName, "")
 	if raw == "" {

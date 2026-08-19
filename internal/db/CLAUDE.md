@@ -82,6 +82,34 @@ compartilhado com `ai`, `selectors` e `scraper` — nenhum outro pacote monta SQ
   quebrar nenhum teste deste pacote. O `WHERE property_id = $1::uuid` é atendido
   pelo índice `idx_listings_property_id` (criado em `migrations/004`). Imóvel sem
   anúncios devolve slice vazia, nunca `nil` nem erro.
+- **A fila de enriquecimento vive em três funções**, consumidas por
+  `internal/enrichqueue`: `ListPendingListings` (predicado
+  `enriched_at IS NULL OR updated_at > enriched_at`, `ORDER BY id`, `LIMIT` e
+  cursor `id > afterID`), `UpdateListingEnrichment` (as colunas derivadas) e
+  `MarkListingEnriched` (o carimbo). **Nenhuma das duas de escrita toca
+  `updated_at`**, e isso está comentado no SQL: `updated_at` é metade do
+  predicado da fila, então setá-lo ali deixaria o anúncio pendente para sempre —
+  um passe **pago** de IA por run, sobre o catálogo inteiro. São duas funções, e
+  não uma com flag, porque os dois momentos são distintos no fluxo (persistir
+  vem antes do agrupamento; carimbar, depois da consolidação) e um booleano
+  permitiria carimbar cedo. Anúncio inexistente é no-op sem erro nas duas
+  (`DeleteStaleListings` pode ter apagado a linha entre a leitura e a escrita).
+- **O cursor de `ListPendingListings` não é paginação cosmética.** Um anúncio que
+  falha não recebe `enriched_at` e continua casando com o predicado: com `LIMIT`
+  sem cursor, o lote seguinte devolveria as mesmas linhas para sempre.
+- **`upsertListingSQL` só bumpa `updated_at` quando algum campo coletado mudou**
+  (`IS DISTINCT FROM` campo a campo, dentro de um `CASE`). Antes ele fazia
+  `NOW()` incondicional em todo `ON CONFLICT`, o que devolvia à fila de
+  enriquecimento todo anúncio visto em toda coleta. `last_seen_at = NOW()`
+  continua **incondicional** e não pode ser condicionado: ele responde "o anúncio
+  ainda está no site", não "o anúncio mudou", e é ele que protege a linha de
+  `DeleteStaleListings`.
+- **`db.PendingListing` é um modelo novo, não uma extensão de `Listing`.**
+  `Listing` é o modelo de leitura do **merge**, amarrado à ordem de colunas de
+  `selectListingsByPropertyIDSQL`; ampliá-lo obrigaria `scanListing` a preencher
+  colunas que aquela query não seleciona. `PendingListing` carrega exatamente o
+  que `grouping.Listing` exige. `db.ListingEnrichment` é o payload de escrita
+  correspondente, com ponteiros pela mesma regra de `Property` (nil = NULL).
 - **`db.Listing` é o modelo de leitura, separado de `RawListing`.** `RawListing`
   é o modelo de **escrita** da coleta: identidade `(SourceDomain, ListingURL)`,
   sem `id`, com `ExtraData`. O de leitura precisa do `id` (é a ordem estável do
@@ -197,7 +225,19 @@ compartilhado com `ai`, `selectors` e `scraper` — nenhum outro pacote monta SQ
 
 - Os testes deste pacote **não tocam no banco**: cobrem só as funções puras
   (montagem de argumentos, validação, JSON, bounding box/haversine, agregação de
-  `staleCountsByProperty`). O comportamento do SQL — upsert, `ON CONFLICT`,
+  `staleCountsByProperty`) e três **contratos em string** — que o SQL de
+  enriquecimento não menciona `updated_at`, que o upsert mantém a guarda
+  `IS DISTINCT FROM` com `last_seen_at` incondicional, e que o predicado de
+  `selectPendingListingsSQL` continua idêntico ao do índice parcial de
+  `migrations/006` (divergir faz o índice deixar de ser usado em silêncio, e a
+  fila volta a varrer a tabela inteira). As três regras foram confirmadas contra
+  um PostgreSQL 17 real: upsert do **mesmo** payload não bumpa `updated_at` e
+  renova `last_seen_at`; upsert com `price_raw` alterado bumpa; e o `EXPLAIN` da
+  fila usa `idx_listings_enrichment_queue`. Esses são os bugs
+  mais caros e mais invisíveis do pacote: só se manifestariam meses depois, como
+  "o catálogo inteiro é reprocessado (e repago) todo dia" ou "este anúncio nunca
+  sai da fila". A verificação em PostgreSQL real de "anúncio inalterado não bumpa
+  `updated_at`" fica para o QA. O comportamento do SQL — upsert, `ON CONFLICT`,
   contagem do DELETE, `RETURNING`, `ANY($1::uuid[])`, idempotência do vínculo,
   `GREATEST` no contador, guarda do `DeleteProperty` e a atomicidade da limpeza
   em lote — depende de um PostgreSQL real e fica para o QA / testes de

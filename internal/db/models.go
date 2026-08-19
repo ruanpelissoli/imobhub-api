@@ -117,6 +117,71 @@ type Listing struct {
 	ImageURLs []string
 }
 
+// PendingListing é uma linha de listings na forma que a fila de enriquecimento
+// consome: os campos "_raw" que alimentam os enrichers mais o estado atual do
+// enriquecimento, que é o que permite montar um grouping.Listing sem uma segunda
+// leitura.
+//
+// É um modelo **novo**, e não uma extensão de Listing, de propósito. Listing é o
+// modelo de leitura do merge, amarrado à ordem de colunas de
+// selectListingsByPropertyIDSQL; ampliá-lo obrigaria scanListing a preencher
+// colunas que aquela query não seleciona, ou a manter dois scanners para o mesmo
+// tipo — e o primeiro campo esquecido viraria um canônico consolidado com NULL.
+type PendingListing struct {
+	// ID é listings.id, a chave da ordenação e do cursor da fila.
+	ID int64
+	// SourceDomain e ListingURL identificam o anúncio na origem; entram nos
+	// logs e nas mensagens de erro de cada anúncio processado.
+	SourceDomain string
+	ListingURL   string
+	// Campos "_raw": NULL na coluna chega aqui como "", mesma convenção de
+	// RawListing.
+	TitleRaw       string
+	DescriptionRaw string
+	AddressRaw     string
+	AreaRaw        string
+	BedroomsRaw    string
+	// NormalizedNeighborhood é o resultado do passe anterior, quando houve.
+	// String vazia é o que o normalizador devolve para "não reconhecido"; a
+	// coluna guarda NULL nesse caso (ver UpdateListingEnrichment).
+	NormalizedNeighborhood string
+	// BedroomCount é ponteiro porque a ausência é informação: nil é "o anúncio
+	// não informa", 0 seria "sem quarto separado".
+	BedroomCount *int
+	// Amenities e ImageURLs vêm de colunas TEXT[] nullable; NULL e vazio são a
+	// mesma coisa na leitura (ver normalizeTextArray).
+	Amenities []string
+	ImageURLs []string
+	// Lat e Lng são o resultado da geocodificação anterior. nil = nunca
+	// geocodificado ou endereço irresolvível.
+	Lat *float64
+	Lng *float64
+	// PropertyID é o vínculo já existente. Quando presente, o agrupamento sai
+	// cedo sem chamar a IA — é a saída barata de grouping.GroupListing.
+	PropertyID *string
+}
+
+// ListingEnrichment é o payload de escrita das colunas de enriquecimento de um
+// anúncio. Os campos opcionais são ponteiros pela mesma razão de Property: nil
+// vira NULL na coluna, e NULL é a forma honesta de dizer "não reconhecido".
+//
+// Não carrega enriched_at: o carimbo é uma operação separada
+// (MarkListingEnriched), que só acontece depois do agrupamento e da consolidação.
+type ListingEnrichment struct {
+	// ID é listings.id do anúncio a atualizar. Obrigatório.
+	ID int64
+	// NormalizedNeighborhood é nil quando o normalizador não reconheceu nada —
+	// nunca string vazia (contrato de NeighborhoodNormalizer.Normalize).
+	NormalizedNeighborhood *string
+	BedroomCount           *int
+	// Amenities nil é gravado como array vazio, nunca NULL, seguindo a mesma
+	// regra de RawListing.ImageURLs.
+	Amenities []string
+	// Lat e Lng são gravados juntos: um par pela metade não é geocodificação.
+	Lat *float64
+	Lng *float64
+}
+
 // Property é o registro canônico de um imóvel: a versão consolidada e já
 // normalizada do que vários anúncios (RawListing) dizem sobre o mesmo imóvel
 // físico. A relação é 1:N — cada linha de listings aponta para no máximo uma

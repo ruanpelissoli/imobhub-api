@@ -17,9 +17,13 @@ enrichers independentes:
   e, depois, o `properties` canônico.
 
 **O pacote deixou de ser puro** com o geocoder: ele faz rede (Nominatim) e
-importa `internal/ratelimit`. Continua **não** tocando banco. **Ainda não tem
-chamador**: o wiring entra junto com a fila de enriquecimento
-(`enriched_at IS NULL`). Não duplicar esse plumbing por enricher.
+importa `internal/ratelimit`. Continua **não** tocando banco.
+
+**O chamador dos três enrichers é `internal/enrichqueue`**, a fila que drena
+`listings` por `enriched_at`. Ela monta **uma única instância de cada um**,
+compartilhada por todos os workers — obrigatório no caso do geocoder, que carrega
+o `DomainLimiter` de 1 req/s e o cache com negative caching (N instâncias =
+N req/s = bloqueio do User-Agent). Não duplique esse plumbing por enricher.
 
 ---
 

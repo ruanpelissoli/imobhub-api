@@ -24,14 +24,19 @@ orquestra; a lógica está aqui.
 Grafo de importação atual (mantê-lo acíclico e raso):
 
 ```
-cmd/scraper → config, db, scraper
+cmd/scraper → config, db, scraper, enrichqueue
 scraper     → config, db, ratelimit, robots, selectors, sources, pgxpool
+enrichqueue → ai, config, db, enrichment, grouping, pgxpool
 selectors   → ai, db, httpclient
 grouping    → ai, db, pgxpool
 ai          → db          (SelectorFields, Property e as constantes de render mode)
 robots      → net/http (client próprio, timeout de 10s para o robots.txt)
 enrichment  → ratelimit, net/http (client próprio, timeout de 10s), stdlib + x/text + yaml/v4 (vocabulário de comodidades)
 ```
+
+`enrichqueue` é o pacote mais "alto" do grafo: ele existe justamente para ser o
+único lugar que enxerga `enrichment` **e** `db`/`ai` ao mesmo tempo, mantendo
+`enrichment` sem banco e sem IA.
 
 `scraper` chega a `httpclient` **através** de `selectors.StaticFetcher`/
 `HeadlessFetcher`: os adaptadores já fecham sobre o User-Agent, e reusá-los
@@ -78,21 +83,25 @@ comodidades do `TermExtractor` chega por parâmetro de construtor (de
   Segue o padrão de `selectors` — orquestra `ai` + `db` — e **não** vive em
   `enrichment` justamente porque aquele pacote não importa `db` nem `ai`. As
   interfaces de acesso a dados são declaradas nele (consumidor); `db` continua
-  sem struct de repositório. Como os enrichers, **nenhum dos dois tem
-  chamador**: o plumbing é a mesma task de follow-up compartilhada descrita
-  abaixo, e nela o merge roda depois do agrupamento.
-- `enrichment/` entrega hoje o normalizador de bairros
+  sem struct de repositório. Quem chama `GroupListing` e, **depois**,
+  `MergePropertyData` é `enrichqueue`.
+- `enrichment/` entrega o normalizador de bairros
   (`NeighborhoodNormalizer.Normalize`), o geocoder (`Geocoder.Geocode`, via
   Nominatim) e o extrator de termos (`TermExtractor.Extract`, quartos +
-  comodidades), e **nenhum deles tem chamador**. Persistir os campos —
-  `normalized_neighborhood`, `lat`/`lng`, e `bedroom_count`/`amenities` —
-  com fila por `enriched_at IS NULL`, função de UPDATE em `db` e wiring em
-  `cmd/scraper` é task de follow-up **compartilhada**. Não duplicar esse
-  plumbing por enricher. Em particular, o filtro "anúncio já geocodificado"
-  (`lat IS NULL`) é da fila, não do geocoder: `enrichment` não importa `db`.
-  Quem ligar o `TermExtractor` carrega o vocabulário **uma vez** com
-  `enrichment.NewTermExtractor(cfg.AmenitiesFile)` e injeta o extrator — não
-  chame o loader por anúncio.
+  comodidades). O chamador dos três é `enrichqueue`, que também persiste
+  `normalized_neighborhood`, `lat`/`lng`, `bedroom_count` e `amenities`. O
+  filtro "anúncio já enriquecido" é da fila, não do geocoder: `enrichment` não
+  importa `db`. O vocabulário do `TermExtractor` é carregado **uma vez** em
+  `enrichqueue.NewPipeline` (`enrichment.NewTermExtractor(cfg.AmenitiesFile)`) e
+  o extrator é injetado — não chame o loader por anúncio.
+- `enrichqueue/` é o orquestrador assíncrono do enriquecimento: drena
+  `listings` por `enriched_at IS NULL OR updated_at > enriched_at`, num worker
+  pool de `ENRICHMENT_WORKERS`, e roda ao final de cada coleta
+  (`cmd/scraper -only=all`). **A ordem das etapas é invariante**: os campos
+  derivados são persistidos **antes** do agrupamento e da consolidação, porque
+  `MergePropertyData` os relê do banco. Uma **única instância** de geocoder,
+  extrator, normalizador e agrupador é compartilhada por todos os workers — o
+  geocoder carrega o `DomainLimiter` de 1 req/s do Nominatim.
 - Logs operacionais usam `log/slog` (handler JSON configurado em `main`). Não
   usar `fmt.Println`/`log.Printf`: quebra o parsing dos logs em produção.
 - Erros são embrulhados com `fmt.Errorf("pacote: ... %w", err)` e sempre citam o

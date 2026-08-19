@@ -81,4 +81,34 @@ tabelas são o contrato que todas as queries `pgx` assumem.
   latitude/longitude; busca por raio exigirá outro índice.
 - `listings.enriched_at IS NULL` = anúncio pendente de enriquecimento. É o
   filtro da fila; comparar com `updated_at` diz se o anúncio mudou desde o
-  último passe.
+  último passe. **Isso só funciona porque `upsertListingSQL` passou a bumpar
+  `updated_at` condicionalmente** (`IS DISTINCT FROM` campo a campo): com o
+  `NOW()` incondicional que existia antes, o catálogo inteiro voltava à fila
+  todo dia. Ver `internal/db/CLAUDE.md`.
+- **O índice da fila é `idx_listings_enrichment_queue` (`006`), não o
+  `idx_listings_pending_enrichment` do `005`.** O do `005` era
+  `(id) WHERE enriched_at IS NULL` e **nunca seria usado**: o PostgreSQL só
+  aproveita um índice parcial quando consegue provar que o resultado da query
+  satisfaz o predicado do índice, e o `OR` da fila
+  (`enriched_at IS NULL OR updated_at > enriched_at`) torna essa prova
+  impossível — o segundo ramo não tem índice, não há BitmapOr a montar e o
+  planner cai num scan de `listings_pkey` com filtro. Era custo de manutenção na
+  tabela mais quente do schema sem ganho de leitura. O `006` derruba aquele e
+  cria um cujo predicado é **idêntico** ao da query, o que torna a implicação
+  trivial. O comentário dentro do arquivo `005` está superado; ele não pode ser
+  editado (migrations são imutáveis) e a correção vive no `006`.
+- **O predicado de `idx_listings_enrichment_queue` precisa continuar idêntico ao
+  WHERE de `selectPendingListingsSQL`.** Se um dos dois mudar sozinho, o índice
+  deixa de ser usado **em silêncio**: a query continua correta e volta a varrer a
+  tabela inteira. `TestEnrichmentQueueIndexPredicateMatchesTheQuery`
+  (`internal/db`) compara os dois textos justamente para flagrar isso.
+- **Medido** em PostgreSQL 17, com 50 mil anúncios e 200 pendentes: com o índice
+  do `005`, o plano é `Index Scan using listings_pkey` + `Filter`, descartando
+  49.792 linhas (12,4 ms) — ou seja, o parcial é ignorado, como previsto. Com o
+  do `006`, `Index Only Scan using idx_listings_enrichment_queue` (0,08 ms). A
+  diferença não é constante: o `005` custa proporcional ao **total** de anúncios,
+  o `006` ao número de **pendentes**.
+- Comparação de `timestamptz` é `IMMUTABLE`, então ela é aceita num predicado de
+  índice parcial. O que **não** seria aceito é `now()` ou um cast dependente de
+  fuso — se o predicado da fila algum dia virar "enriquecido nos últimos N dias",
+  ele não pode ir para um índice.
