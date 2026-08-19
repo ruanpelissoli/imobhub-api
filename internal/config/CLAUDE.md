@@ -6,8 +6,14 @@ Lê e valida toda a configuração de runtime a partir de variáveis de ambiente
 ambiente diretamente.
 
 ## Business logic
-- **Obrigatórias:** `DATABASE_URL`, `ANTHROPIC_API_KEY`. Sem elas o processo não
-  sobe.
+- **Obrigatórias:** `DATABASE_URL`, `REDIS_URL`, `ANTHROPIC_API_KEY`. Sem elas o
+  processo não sobe.
+- **`REDIS_URL` não tem default**, apesar de `redis://localhost:6379/0` ser o
+  valor óbvio em dev. Pela mesma regra das demais variáveis do projeto (nada de
+  fallback silencioso): um localhost implícito faria o processo apontar para um
+  Redis que não é o do ambiente — e cache no lugar errado é o tipo de erro que
+  só aparece como "dado velho" muito depois. Quem consome a URL é
+  `internal/cache`; `config` não valida formato nem conectividade.
 - **Obrigatória condicional:** `GEOCODING_API_KEY`, exigida **apenas** quando
   `GEOCODING_PROVIDER=googlemaps` (o Nominatim é gratuito e não aceita chave).
   Por isso o provider é resolvido **antes** do relatório de faltantes — a falta
@@ -69,8 +75,9 @@ Importado por `cmd/scraper`.
   struct `Config` e o `.env.example` na raiz. O `.env.example` é a documentação
   de fato para quem sobe o projeto.
 - `Config` não é validada além do parsing (ex.: não checamos se a
-  `DATABASE_URL` é alcançável nem se `MIGRATIONS_DIR` existe). Essa validação é
-  do `internal/db`, que faz `Ping` na conexão e lê o diretório de migrations.
+  `DATABASE_URL`/`REDIS_URL` são alcançáveis nem se `MIGRATIONS_DIR` existe).
+  Essa validação é do `internal/db` (que faz `Ping` na conexão e lê o diretório
+  de migrations) e do `internal/cache` (que faz `PING` no Redis).
 - Caminhos (`SOURCES_FILE`, `MIGRATIONS_DIR`, `AMENITIES_FILE`) são usados como
   vieram: relativos ao **working directory do processo**, não à raiz do
   repositório. No container, o `Dockerfile` precisa copiar o arquivo/diretório
@@ -81,4 +88,4 @@ Importado por `cmd/scraper`.
   valida de novo — defesa em profundidade. Ao adicionar um provider, mexa nos dois.
 - `GEOCODING_API_KEY` nunca aparece em log nem em mensagem de erro. `Config` é
   logada em lugar nenhum; se isso mudar, redija a chave (mesma regra da
-  `DATABASE_URL`, que carrega a senha).
+  `DATABASE_URL` e da `REDIS_URL`, que carregam a senha).

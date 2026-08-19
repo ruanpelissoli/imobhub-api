@@ -2,8 +2,8 @@
 
 ## Purpose
 Ponto de entrada do coletor. Responsável apenas por: configurar o logger, ler a
-flag `-only`, ler a configuração, abrir o pool do banco, aplicar as migrations e
-disparar as etapas (`scraper.RunPipeline` e `enrichqueue.RunEnrichment`).
+flag `-only`, ler a configuração, abrir o pool do banco, aplicar as migrations,
+abrir o client do Redis e disparar as etapas (`scraper.RunPipeline` e `enrichqueue.RunEnrichment`).
 Nenhuma regra de negócio mora aqui — ela vive em `internal/`.
 
 ## Key decisions
@@ -39,16 +39,28 @@ Nenhuma regra de negócio mora aqui — ela vive em `internal/`.
   (`scraper.NewPipeline`, `enrichqueue.NewPipeline`), não aqui.
 
 ## Business logic / invariantes
-- Ordem de inicialização é obrigatória: **config → db → migrations → coleta**. A
-  config valida as variáveis obrigatórias, o `db.Connect` valida a conectividade
-  com um `Ping` e o `db.RunMigrations` garante que o schema esperado existe;
-  todos falham no boot em vez de na primeira query.
+- Ordem de inicialização é obrigatória: **config → db → migrations → cache →
+  coleta**. A config valida as variáveis obrigatórias, o `db.Connect` valida a
+  conectividade com um `Ping`, o `db.RunMigrations` garante que o schema
+  esperado existe e o `cache.New` valida o Redis com um `PING`; todos falham no
+  boot em vez de na primeira query.
+- **O cache vem depois das migrations** porque o banco é o recurso sem o qual
+  nada do pipeline funciona: quando os dois estão fora do ar, o erro que o
+  operador vê é o do banco.
 - `db.RunMigrations` recebe `cfg.MigrationsDir` (`MIGRATIONS_DIR`, default
   `migrations`), resolvido a partir do **working directory** do processo — rode
   o binário da raiz do repositório, ou copie `migrations/` ao lado dele na
   imagem.
 - `defer pool.Close()` só é registrado quando `db.Connect` retorna `err == nil`
-  — o contrato de `Connect` é fechar o pool sozinho em caso de erro.
+  — o contrato de `Connect` é fechar o pool sozinho em caso de erro. A mesma
+  regra vale para `defer redisClient.Close()` e `cache.New`: os dois contratos
+  são idênticos de propósito.
+- **Falha no Redis é erro de boot (exit 1), mesmo sem consumidor do cache.**
+  Hoje o client é criado e fechado sem uso; a alternativa — subir sem cache e
+  logar um warning — é mudança de comportamento e precisa de decisão explícita,
+  não de um remendo aqui. Consequência prática: `REDIS_URL` é obrigatória e
+  `docker compose up -d db redis` passa a ser pré-requisito de qualquer
+  `go run ./cmd/scraper`.
 
 - **Em `-only=all`, o enriquecimento só roda se a coleta tiver dado certo.**
   Enriquecer sobre uma coleta interrompida no meio processaria um catálogo que
@@ -67,12 +79,14 @@ Nenhuma regra de negócio mora aqui — ela vive em `internal/`.
   de erro diz isso explicitamente, e os anúncios sem `enriched_at` são
   reprocessados no próximo run.
 - `go run ./cmd/scraper` executa a coleta completa: exige `DATABASE_URL`,
-  `ANTHROPIC_API_KEY` e — para as fontes `headless` — Chrome/Chromium no PATH.
+  `REDIS_URL`, `ANTHROPIC_API_KEY` e — para as fontes `headless` —
+  Chrome/Chromium no PATH.
 - Como cada execução aplica migrations, subir o binário **altera o schema**. Não
   aponte um processo de versão antiga para um banco já migrado por uma versão
   nova esperando que ele reverta: não há `down`.
 
 ## Dependencies
-`internal/config`, `internal/db`, `internal/scraper` e `internal/enrichqueue`.
+`internal/config`, `internal/db`, `internal/cache`, `internal/scraper` e
+`internal/enrichqueue`.
 Deve permanecer fino — se lógica começar a se acumular aqui, mova para um pacote
 em `internal/`.

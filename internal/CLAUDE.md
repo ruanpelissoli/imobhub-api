@@ -24,7 +24,8 @@ orquestra; a lógica está aqui.
 Grafo de importação atual (mantê-lo acíclico e raso):
 
 ```
-cmd/scraper → config, db, scraper, enrichqueue
+cmd/scraper → config, db, cache, scraper, enrichqueue
+cache       → go-redis    (folha, como config e db)
 scraper     → config, db, ratelimit, robots, selectors, sources, pgxpool
 enrichqueue → ai, config, db, enrichment, grouping, pgxpool
 selectors   → ai, db, httpclient
@@ -47,7 +48,10 @@ mesmo jeito.
 grafo prevê o sentido contrário. O User-Agent chega como string (de `config` ou
 de `httpclient.Client.UserAgent()`).
 
-`config` é a única folha do grafo — não importa nada do projeto.
+`config` e `cache` são folhas do grafo — não importam nada do projeto. `cache`
+recebe a `REDIS_URL` por parâmetro (de `cfg.RedisURL`, em `main`) justamente
+para continuar assim, e entrega **só** o `*redis.Client` validado por `Ping`:
+set/get, TTL e desenho de chaves ficam em quem consumir o cache.
 
 `enrichment` **era** folha e deixou de ser com o geocoder: ele fala com o
 Nominatim e reusa `ratelimit.DomainLimiter` (espaçamento fixo por host, sem
