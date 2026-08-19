@@ -4,11 +4,14 @@
 package api
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/imobhub/api/internal/db"
 )
 
 // apiV1Prefix é o prefixo de toda rota de negócio. Versionar desde a primeira
@@ -59,8 +62,12 @@ func NewRouter(deps Deps) http.Handler {
 // entram aqui, com o padrão do ServeMux 1.22+ ("GET "+apiV1Prefix+"/properties"),
 // para que nenhuma delas precise repetir a montagem dos middlewares.
 func registerV1Routes(mux *http.ServeMux, deps Deps) {
-	_ = mux
-	_ = deps
+	search := func(ctx context.Context, params db.PropertySearchParams) ([]db.Property, int64, error) {
+		return db.SearchProperties(ctx, deps.Pool, params)
+	}
+
+	mux.Handle("GET "+apiV1Prefix+"/properties",
+		handleSearchProperties(search, newPropertyCache(deps.Redis), deps.logger()))
 }
 
 // handleHealth é liveness, não readiness: responde 200 sem tocar em Postgres ou

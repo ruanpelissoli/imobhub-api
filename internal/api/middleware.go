@@ -16,10 +16,14 @@ const (
 	headerAllowHeaders  = "Access-Control-Allow-Headers"
 	headerMaxAge        = "Access-Control-Max-Age"
 	headerRequestMethod = "Access-Control-Request-Method"
+	headerExposeHeaders = "Access-Control-Expose-Headers"
 
 	corsAllowMethods = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
 	corsAllowHeaders = "Content-Type, Authorization"
 	corsMaxAge       = "600"
+	// corsExposeHeaders libera os headers de resposta que o browser esconde por
+	// padrão. Sem X-Cache aqui, o front não consegue nem medir o hit rate.
+	corsExposeHeaders = headerCacheStatus
 )
 
 // responseWriter observa o que a cadeia escreveu, para que o logging registre
@@ -132,6 +136,9 @@ func cors(next http.Handler, origins []string) http.Handler {
 
 		w.Header().Add(headerVary, headerOrigin)
 		w.Header().Set(headerAllowOrigin, origin)
+		// Expose-Headers vale para a resposta real, não para o preflight — por
+		// isso é setado aqui, antes do desvio de OPTIONS.
+		w.Header().Set(headerExposeHeaders, corsExposeHeaders)
 
 		if r.Method == http.MethodOptions && r.Header.Get(headerRequestMethod) != "" {
 			w.Header().Set(headerAllowMethods, corsAllowMethods)

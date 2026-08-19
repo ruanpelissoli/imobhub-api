@@ -131,6 +131,14 @@ func TestCORSAllowsListedOrigin(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
+	// Sem Expose-Headers o browser esconde o X-Cache e o front não consegue nem
+	// medir o hit rate da busca.
+	if got := rec.Header().Get(headerExposeHeaders); got != corsExposeHeaders {
+		t.Errorf("%s = %q, want %q", headerExposeHeaders, got, corsExposeHeaders)
+	}
+	if !strings.Contains(corsExposeHeaders, headerCacheStatus) {
+		t.Errorf("corsExposeHeaders = %q, want conter %q", corsExposeHeaders, headerCacheStatus)
+	}
 }
 
 func TestCORSIgnoresUnlistedOrigin(t *testing.T) {
@@ -147,6 +155,9 @@ func TestCORSIgnoresUnlistedOrigin(t *testing.T) {
 	}
 	if got := rec.Header().Get(headerVary); got != "" {
 		t.Errorf("%s = %q, want vazio", headerVary, got)
+	}
+	if got := rec.Header().Get(headerExposeHeaders); got != "" {
+		t.Errorf("%s = %q, want vazio", headerExposeHeaders, got)
 	}
 }
 

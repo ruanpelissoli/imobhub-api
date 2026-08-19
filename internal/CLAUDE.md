@@ -61,7 +61,9 @@ stdlib (nenhum `chi`/`gorilla` no `go.mod`); o porquê está em
 `config` e `cache` são folhas do grafo — não importam nada do projeto. `cache`
 recebe a `REDIS_URL` por parâmetro (de `cfg.RedisURL`, em `main`) justamente
 para continuar assim, e entrega **só** o `*redis.Client` validado por `Ping`:
-set/get, TTL e desenho de chaves ficam em quem consumir o cache.
+set/get, TTL e desenho de chaves ficam em quem consumir o cache. O primeiro
+consumidor é `api`, na busca de imóveis — chave, TTL e política de fallback
+estão documentados em `internal/api/CLAUDE.md`, não aqui.
 
 `enrichment` **era** folha e deixou de ser com o geocoder: ele fala com o
 Nominatim e reusa `ratelimit.DomainLimiter` (espaçamento fixo por host, sem
@@ -116,11 +118,16 @@ comodidades do `TermExtractor` chega por parâmetro de construtor (de
   `MergePropertyData` os relê do banco. Uma **única instância** de geocoder,
   extrator, normalizador e agrupador é compartilhada por todos os workers — o
   geocoder carrega o `DomainLimiter` de 1 req/s do Nominatim.
-- `api/` é o esqueleto do servidor HTTP: roteador com o grupo `/api/v1`
-  (ainda **sem rotas de negócio** — o ponto de extensão é `registerV1Routes`),
+- `api/` é o servidor HTTP: roteador com o grupo `/api/v1` (o ponto de extensão
+  é `registerV1Routes` — registrar fora dele ignora a cadeia de middlewares),
   `/health` de liveness fora do grupo, middlewares de recovery/logging/CORS e a
   conversão dos 404/405 do `ServeMux` para o envelope `{"error":"..."}`. Esse
-  envelope é convenção do projeto para toda resposta de erro.
+  envelope é convenção do projeto para toda resposta de erro. A primeira rota de
+  negócio é `GET /api/v1/properties` (busca paginada de `db.SearchProperties`
+  com DTO próprio em snake_case e cache Redis de 5 min). O acesso a dados e ao
+  Redis entra por seams declarados **no próprio `api`** (`propertySearcher`,
+  `cacheStore`), como `grouping` faz — é o que mantém os testes do pacote sem
+  Postgres e sem Redis.
 - Logs operacionais usam `log/slog` (handler JSON configurado em `main`). Não
   usar `fmt.Println`/`log.Printf`: quebra o parsing dos logs em produção.
 - Erros são embrulhados com `fmt.Errorf("pacote: ... %w", err)` e sempre citam o
