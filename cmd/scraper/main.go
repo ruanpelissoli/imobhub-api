@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/imobhub/api/internal/cache"
 	"github.com/imobhub/api/internal/config"
 	"github.com/imobhub/api/internal/db"
 	"github.com/imobhub/api/internal/enrichqueue"
@@ -81,6 +82,16 @@ func run(only string) error {
 	if err := db.RunMigrations(ctx, pool, cfg.MigrationsDir); err != nil {
 		return err
 	}
+
+	// O Redis é validado no boot, como o banco: um cache inalcançável
+	// descoberto no meio da coleta é mais caro de diagnosticar do que uma falha
+	// de inicialização. Ainda não há consumidor do client — a decisão de falhar
+	// (em vez de degradar sem cache) está registrada em cmd/scraper/CLAUDE.md.
+	redisClient, err := cache.New(ctx, cfg.RedisURL)
+	if err != nil {
+		return err
+	}
+	defer redisClient.Close()
 
 	slog.Info("imobhub scraper started",
 		"stage", stage,

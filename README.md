@@ -8,6 +8,8 @@ anúncios no PostgreSQL.
 
 - **Go 1.25+**
 - **PostgreSQL** acessível pela `DATABASE_URL` (as migrations rodam no startup).
+- **Redis** acessível pela `REDIS_URL`. A conexão é validada com um `PING` no
+  startup: sem Redis no ar o processo sai com erro em vez de subir.
 - **Chrome ou Chromium no PATH** — necessário apenas para as fontes que só
   montam o conteúdo via JavaScript, atendidas por `httpclient.FetchHeadless`.
   Sem o binário, essas fontes falham na alocação do browser (não é erro de
@@ -62,9 +64,6 @@ rodam no startup.
 O mesmo `.env` serve para os dois modos de execução: os valores apontam para
 `localhost` (para `go run` no host) e o serviço `api` sobrescreve
 `DATABASE_URL`/`REDIS_URL` com os nomes de host da rede do compose.
-
-> O Redis ainda não é consumido por nenhum pacote Go — está no compose como
-> infraestrutura prevista para cache/fila.
 
 ## Executar
 
