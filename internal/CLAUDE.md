@@ -29,7 +29,7 @@ scraper     → config, db, ratelimit, robots, selectors, sources, pgxpool
 selectors   → ai, db, httpclient
 ai          → db          (SelectorFields e as constantes de render mode)
 robots      → net/http (client próprio, timeout de 10s para o robots.txt)
-enrichment  → ratelimit, net/http (client próprio, timeout de 10s), stdlib + x/text
+enrichment  → ratelimit, net/http (client próprio, timeout de 10s), stdlib + x/text + yaml/v4 (vocabulário de comodidades)
 ```
 
 `scraper` chega a `httpclient` **através** de `selectors.StaticFetcher`/
@@ -48,8 +48,9 @@ Nominatim e reusa `ratelimit.DomainLimiter` (espaçamento fixo por host, sem
 burst, cancelável — exatamente a política de 1 req/s do Nominatim) em vez de um
 `time.Ticker` próprio. A aresta `enrichment → ratelimit` é acíclica e rasa. O
 pacote continua **sem tocar banco e sem IA**: o normalizador de bairros segue
-puro e carrega sua tabela de aliases embutida com `//go:embed`, para não virar
-mais uma variável de ambiente nem mais um `COPY` no Dockerfile.
+puro e carrega sua tabela de aliases embutida com `//go:embed`; o vocabulário de
+comodidades do `TermExtractor` chega por parâmetro de construtor (de
+`config.AmenitiesFile`) via `yaml/v4`.
 
 ## Gotchas
 - `selectors/` já está implementado (`SelectorService`: reuso da linha
@@ -66,13 +67,17 @@ mais uma variável de ambiente nem mais um `COPY` no Dockerfile.
   responsabilidade de `httpclient`. `sources/` já está implementado (`ReadSources`) — o `doc.go`
   dele deu lugar a `reader.go`, que carrega o doc do pacote.
 - `enrichment/` entrega hoje o normalizador de bairros
-  (`NeighborhoodNormalizer.Normalize`) e o geocoder (`Geocoder.Geocode`, via
-  Nominatim), e **nenhum dos dois tem chamador**. Persistir os campos —
-  `normalized_neighborhood`, `lat`/`lng`, e depois `bedroom_count`/`amenities` —
+  (`NeighborhoodNormalizer.Normalize`), o geocoder (`Geocoder.Geocode`, via
+  Nominatim) e o extrator de termos (`TermExtractor.Extract`, quartos +
+  comodidades), e **nenhum deles tem chamador**. Persistir os campos —
+  `normalized_neighborhood`, `lat`/`lng`, e `bedroom_count`/`amenities` —
   com fila por `enriched_at IS NULL`, função de UPDATE em `db` e wiring em
   `cmd/scraper` é task de follow-up **compartilhada**. Não duplicar esse
   plumbing por enricher. Em particular, o filtro "anúncio já geocodificado"
   (`lat IS NULL`) é da fila, não do geocoder: `enrichment` não importa `db`.
+  Quem ligar o `TermExtractor` carrega o vocabulário **uma vez** com
+  `enrichment.NewTermExtractor(cfg.AmenitiesFile)` e injeta o extrator — não
+  chame o loader por anúncio.
 - Logs operacionais usam `log/slog` (handler JSON configurado em `main`). Não
   usar `fmt.Println`/`log.Printf`: quebra o parsing dos logs em produção.
 - Erros são embrulhados com `fmt.Errorf("pacote: ... %w", err)` e sempre citam o

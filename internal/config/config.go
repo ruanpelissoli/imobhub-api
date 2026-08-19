@@ -26,6 +26,7 @@ const (
 	// DefaultGeocodingRateLimitMS é o intervalo mínimo entre requisições ao
 	// provider de geocodificação. O Nominatim permite no máximo 1 req/s.
 	DefaultGeocodingRateLimitMS = 1000
+	DefaultAmenitiesFile        = "configs/amenities.yaml"
 
 	envDatabaseURL        = "DATABASE_URL"
 	envAnthropicAPIKey    = "ANTHROPIC_API_KEY"
@@ -36,6 +37,7 @@ const (
 	envGeocodingProvider  = "GEOCODING_PROVIDER"
 	envGeocodingAPIKey    = "GEOCODING_API_KEY"
 	envGeocodingRateLimit = "GEOCODING_RATE_LIMIT_MS"
+	envAmenitiesFile      = "AMENITIES_FILE"
 )
 
 // Providers de geocodificação aceitos em GEOCODING_PROVIDER.
@@ -77,6 +79,9 @@ type Config struct {
 	// GeocodingRateLimit é o intervalo mínimo entre requisições ao provider de
 	// geocodificação.
 	GeocodingRateLimit time.Duration
+	// AmenitiesFile é o caminho do arquivo YAML com o vocabulário de comodidades
+	// usado pelo pacote enrichment. Relativo ao working directory do processo.
+	AmenitiesFile string
 }
 
 // ErrMissingRequired indica que uma ou mais variáveis obrigatórias não foram
@@ -142,6 +147,7 @@ func Load() (*Config, error) {
 		GeocodingProvider:  geocodingProvider,
 		GeocodingAPIKey:    geocodingAPIKey,
 		GeocodingRateLimit: time.Duration(geocodingRateLimitMS) * time.Millisecond,
+		AmenitiesFile:      lookup(envAmenitiesFile, DefaultAmenitiesFile),
 	}, nil
 }
 
