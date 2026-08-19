@@ -9,7 +9,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/scraper ./cmd/scraper
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/scraper ./cmd/scraper \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/api ./cmd/api
 
 # Runtime. O chromium é obrigatório: as fontes que só montam o conteúdo via
 # JavaScript passam por httpclient.FetchHeadless, que procura o browser no PATH.
@@ -29,13 +30,17 @@ RUN apk add --no-cache \
 WORKDIR /app
 
 COPY --from=build /out/scraper /app/scraper
+COPY --from=build /out/api /app/api
 # Migrations, fontes e o vocabulário de comodidades são lidos em runtime a
 # partir do working directory (MIGRATIONS_DIR, SOURCES_FILE e AMENITIES_FILE são
-# relativos a ele).
+# relativos a ele). A API não lê nenhum deles — só o scraper.
 COPY migrations /app/migrations
 COPY sources.txt /app/sources.txt
 COPY configs /app/configs
 
 # Roda como root de propósito: o Chrome do container sobe com --no-sandbox
 # (ver internal/httpclient/headless.go), configuração que pressupõe root.
+#
+# O entrypoint default é o scraper (o processo batch). O serviço `api` do
+# docker-compose sobrescreve com /app/api, que é o servidor HTTP.
 ENTRYPOINT ["/app/scraper"]

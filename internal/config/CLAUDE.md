@@ -6,8 +6,27 @@ Lê e valida toda a configuração de runtime a partir de variáveis de ambiente
 ambiente diretamente.
 
 ## Business logic
-- **Obrigatórias:** `DATABASE_URL`, `REDIS_URL`, `ANTHROPIC_API_KEY`. Sem elas o
-  processo não sobe.
+- **Dois loaders, um por binário:** `Load()` para `cmd/scraper` e `LoadAPI()`
+  para `cmd/api`. Eles compartilham `lookup` e `ErrMissingRequired`, mas têm
+  listas de obrigatórias diferentes.
+- **Obrigatórias de `Load()` (scraper):** `DATABASE_URL`, `REDIS_URL`,
+  `ANTHROPIC_API_KEY`. Sem elas o processo não sobe.
+- **Obrigatórias de `LoadAPI()`:** apenas `DATABASE_URL` e `REDIS_URL`.
+  Opcionais: `PORT` (default `8080`) e `CORS_ORIGINS` (sem default — vazia
+  desliga o CORS).
+- **`LoadAPI()` existe em vez de afrouxar `Load()`.** Tornar
+  `ANTHROPIC_API_KEY` opcional em `Load()` resolveria o boot da API ao custo de
+  o scraper subir sem chave e quebrar só na primeira chamada de IA, no meio de
+  uma coleta — regressão silenciosa no processo que de fato paga por ela.
+- **`PORT` fora de `[1, 65535]` ou não numérica é erro de boot**, citando o
+  valor recebido (`parsePort`). Nada de fallback silencioso: um `PORT=8O80`
+  (letra no lugar do zero) faria o servidor subir na 8080 enquanto o front
+  continuaria batendo na porta errada, sem uma linha de log explicando.
+- **`CORS_ORIGINS` é uma lista separada por vírgula** (`parseCORSOrigins`, pura
+  e testável): cada entrada sofre `TrimSpace` e as vazias são descartadas — uma
+  vírgula sobrando viraria uma origem `""` que casaria com requisições sem
+  header `Origin`. Ausente ou vazia devolve `nil`, e `internal/api` trata `nil`
+  como "CORS desligado".
 - **`REDIS_URL` não tem default**, apesar de `redis://localhost:6379/0` ser o
   valor óbvio em dev. Pela mesma regra das demais variáveis do projeto (nada de
   fallback silencioso): um localhost implícito faria o processo apontar para um
@@ -68,12 +87,15 @@ ambiente diretamente.
 
 ## Dependencies
 Apenas a stdlib. Não importa nada do projeto — é folha do grafo de importação.
-Importado por `cmd/scraper`.
+Importado por `cmd/scraper` e `cmd/api`.
 
 ## Gotchas
 - Ao adicionar uma variável, atualize **três** lugares: a constante `env*`, a
-  struct `Config` e o `.env.example` na raiz. O `.env.example` é a documentação
-  de fato para quem sobe o projeto.
+  struct (`Config` ou `APIConfig`) e o `.env.example` na raiz. O `.env.example`
+  é a documentação de fato para quem sobe o projeto.
+- **Variável nova que o scraper exige não pode entrar em `LoadAPI()`** sem
+  decisão explícita: cada obrigatória adicionada lá é mais uma coisa que impede
+  a API de subir.
 - `Config` não é validada além do parsing (ex.: não checamos se a
   `DATABASE_URL`/`REDIS_URL` são alcançáveis nem se `MIGRATIONS_DIR` existe).
   Essa validação é do `internal/db` (que faz `Ping` na conexão e lê o diretório

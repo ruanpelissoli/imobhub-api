@@ -1,0 +1,24 @@
+{
+  "run": {
+    "targets": [
+      {
+        "key": "infra",
+        "label": "Postgres + Redis",
+        "kind": "infra",
+        "command": "docker compose up db redis",
+        "stopCommand": "docker compose stop db redis"
+      },
+      {
+        "key": "api",
+        "label": "API HTTP",
+        "kind": "server",
+        "command": "go run ./cmd/api",
+        "installCommand": "go mod download",
+        "port": 8080,
+        "previewPath": "/health",
+        "dependsOn": ["infra"],
+        "restartOnMerge": true
+      }
+    ]
+  }
+}
