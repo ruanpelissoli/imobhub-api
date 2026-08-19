@@ -26,13 +26,40 @@ import (
 // PropertyMatcher é um stub que sempre responde "mesmo imóvel". O que este teste
 // exercita é o SQL de verdade — o predicado da fila, o UPDATE que não toca
 // updated_at, o vínculo e o contador denormalizado.
+// O isolamento deste teste tem **dois lados**, e os dois são obrigatórios:
+// a fila que ele lê (testSourceDomain, ver pendingForTestDomain) e o raio em que
+// ele agrupa (testLat/testLng). Filtrar só a leitura não basta — a partir de
+// GroupListing o wiring é o de produção de verdade, e ele escreve.
 const (
 	// testSourceDomain isola as linhas deste teste; o cleanup apaga por ele.
 	testSourceDomain = "enrichqueue-integration.test"
+
 	// testLat e testLng são o ponto fixo devolvido pelo geocoder stub. Os dois
 	// anúncios caem exatamente no mesmo lugar, que é a premissa do agrupamento.
-	testLat = -15.7942
-	testLng = -47.8822
+	//
+	// **O ponto é no meio do Atlântico Sul de propósito.** alwaysSamePropertyMatcher
+	// aceita candidates[0] sem saber se ele é do teste ou do catálogo real, então
+	// o único isolamento possível do agrupamento é não existir candidato real
+	// dentro de RadiusMeters. Uma coordenada plausível (o centro de Brasília, por
+	// exemplo, que é exatamente onde o Nominatim deposita endereço impreciso do
+	// DF) faria o teste vincular um anúncio de mentira a uma property de verdade,
+	// reconsolidá-la com as fotos e a descrição do seed e — pelo cleanup —
+	// apagá-la. Como a FK é ON DELETE SET NULL, os anúncios reais daquele imóvel
+	// ficariam com property_id NULL **e enriched_at carimbado**: pelo predicado da
+	// fila eles não voltariam para reprocessamento, e o agrupamento pago se
+	// perderia em silêncio.
+	//
+	// Nada aqui depende de a coordenada ser plausível: o geocoder é stub e o
+	// normalizador de bairros não olha lat/lng.
+	testLat = -35.0
+	testLng = -25.0
+
+	// scanPageSize é o passo da varredura da fila, não o teto do resultado. O
+	// filtro por domínio é aplicado em Go, depois da query, então paginar de
+	// `limit` em `limit` (o BatchSize do pipeline, 10) faria uma ida ao Postgres
+	// a cada 10 linhas da fila real — milhares de round-trips para achar duas
+	// linhas num banco que já rodou uma coleta de verdade.
+	scanPageSize = 500
 )
 
 func TestEnrichmentPipelineGroupsTwoListingsIntoOneProperty(t *testing.T) {
@@ -111,12 +138,12 @@ func TestEnrichmentPipelineGroupsTwoListingsIntoOneProperty(t *testing.T) {
 
 // pendingForTestDomain devolve apenas os anúncios pendentes do domínio de teste.
 //
-// **O filtro é o que isola o teste do catálogo real.** `pipeline.Run` drena a
-// fila que este closure devolve, e os stubs abaixo dele são o
-// `db.UpdateListingEnrichment` de verdade: sem o filtro, todo anúncio pendente
-// de um banco de desenvolvimento que já rodou `go run ./cmd/scraper` receberia
-// as coordenadas fixas do stub, seria agrupado à força pelo matcher e sairia
-// carimbado da fila — e o cleanup, que apaga só por `source_domain`, não
+// **É o primeiro dos dois lados do isolamento** (o outro é testLat/testLng).
+// `pipeline.Run` drena a fila que este closure devolver, e do `SaveEnrichment`
+// em diante o wiring é o de produção de verdade: sem o filtro, todo anúncio
+// pendente de um banco de desenvolvimento que já rodou `go run ./cmd/scraper`
+// receberia as coordenadas fixas do stub, seria agrupado à força pelo matcher e
+// sairia carimbado da fila — e o cleanup, que só alcança `source_domain`, não
 // desfaria nada disso.
 //
 // A paginação interna é necessária, e não é preciosismo: filtrar **depois** do
@@ -131,7 +158,7 @@ func pendingForTestDomain(ctx context.Context, pool *pgxpool.Pool, afterID int64
 	mine := make([]db.PendingListing, 0, limit)
 
 	for len(mine) < limit {
-		batch, err := db.ListPendingListings(ctx, pool, afterID, limit)
+		batch, err := db.ListPendingListings(ctx, pool, afterID, scanPageSize)
 		if err != nil {
 			return nil, err
 		}
@@ -145,6 +172,13 @@ func pendingForTestDomain(ctx context.Context, pool *pgxpool.Pool, afterID int64
 				mine = append(mine, listing)
 			}
 		}
+	}
+
+	// A coleta é por página inteira, então a última pode passar do teto. O corte
+	// é seguro porque Run deriva o cursor do **último elemento devolvido**: as
+	// linhas cortadas simplesmente voltam no lote seguinte.
+	if len(mine) > limit {
+		mine = mine[:limit]
 	}
 
 	return mine, nil
@@ -223,21 +257,62 @@ func integrationPool(t *testing.T) *pgxpool.Pool {
 
 // cleanup remove tudo que este teste cria: os anúncios do domínio de teste e os
 // imóveis canônicos que ficarem sem nenhum anúncio depois disso.
+//
+// **Um imóvel canônico com anúncio de terceiro nunca é apagado.** É o cinto de
+// segurança para o dia em que testLat/testLng forem mexidos sem que se lembre do
+// porquê: se o agrupamento vincular um anúncio de teste a uma property real,
+// apagá-la deixaria os anúncios reais dela com property_id NULL (a FK é
+// ON DELETE SET NULL) **e enriched_at carimbado** — invisíveis para a fila e
+// irrecuperáveis sem intervenção manual.
+//
+// Por isso a ordem é: capturar os ids → apagar os anúncios do teste → apagar,
+// dos ids capturados, só os que ficaram sem nenhum anúncio. Apagar as properties
+// primeiro (e proteger com `source_domain <> $1`) funcionaria para a guarda, mas
+// deixaria o contador denormalizado da property sobrevivente inflado, porque o
+// DELETE cru dos anúncios não passa pelo decremento de db.DeleteStaleListings.
 func cleanup(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	if _, err := pool.Exec(ctx, `
-		DELETE FROM properties WHERE id IN (
-			SELECT DISTINCT property_id FROM listings
-			WHERE source_domain = $1 AND property_id IS NOT NULL
-		)`, testSourceDomain); err != nil {
-		t.Fatalf("limpeza das properties: %v", err)
+	var propertyIDs []string
+	rows, err := pool.Query(ctx, `
+		SELECT DISTINCT property_id::text FROM listings
+		WHERE source_domain = $1 AND property_id IS NOT NULL`, testSourceDomain)
+	if err != nil {
+		t.Fatalf("leitura das properties do teste: %v", err)
 	}
+	for rows.Next() {
+		var propertyID string
+		if err := rows.Scan(&propertyID); err != nil {
+			rows.Close()
+			t.Fatalf("leitura das properties do teste: %v", err)
+		}
+		propertyIDs = append(propertyIDs, propertyID)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("leitura das properties do teste: %v", err)
+	}
+
 	if _, err := pool.Exec(ctx, `DELETE FROM listings WHERE source_domain = $1`, testSourceDomain); err != nil {
 		t.Fatalf("limpeza dos listings: %v", err)
+	}
+
+	if len(propertyIDs) == 0 {
+		return
+	}
+
+	// O NOT EXISTS é avaliado depois do DELETE acima (statements separados, não
+	// uma CTE que modifica dados — naquela, o SELECT enxergaria o snapshot
+	// anterior e a guarda nunca liberaria nada).
+	if _, err := pool.Exec(ctx, `
+		DELETE FROM properties p
+		WHERE p.id = ANY($1::uuid[])
+		  AND NOT EXISTS (SELECT 1 FROM listings l WHERE l.property_id = p.id)`,
+		propertyIDs); err != nil {
+		t.Fatalf("limpeza das properties: %v", err)
 	}
 }
 

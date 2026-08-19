@@ -276,19 +276,39 @@ func sumSummaries(results []Summary) Summary {
 // logSummary emite o resumo final, no formato do scraper: mensagem humana (é a
 // linha que o operador procura) mais os atributos estruturados para filtrar e
 // somar.
+//
+// As duas versões da mensagem (concluído/interrompido) compartilham o mesmo
+// corpo de propósito — só o verbo muda. Montá-lo uma vez só é o que garante que
+// mexer nos contadores não faça as duas divergirem.
 func (p *Pipeline) logSummary(ctx context.Context, summary Summary, interrupted bool) {
-	message := fmt.Sprintf("enriquecimento concluído: %d anúncios enfileirados (%d enriquecidos, %d pulados, %d com erro)",
-		summary.Queued, summary.Enriched, summary.Skipped, summary.Failed)
+	// Queued é somado na leitura do lote, antes de processá-lo, então num run
+	// cancelado ele não fecha com os três contadores: os anúncios que nunca
+	// chegaram a um worker são outcomeAborted e, por decisão, não entram em
+	// contador nenhum. Sem este número, quem somasse as colunas acharia que
+	// faltam anúncios sem nenhuma explicação.
+	unprocessed := summary.Queued - summary.Enriched - summary.Skipped - summary.Failed
+
+	verb := "concluído"
 	if interrupted {
-		message = fmt.Sprintf("enriquecimento interrompido: %d anúncios enfileirados (%d enriquecidos, %d pulados, %d com erro)",
-			summary.Queued, summary.Enriched, summary.Skipped, summary.Failed)
+		verb = "interrompido"
 	}
+
+	// Condicional porque num run completo unprocessed é sempre zero, e uma
+	// "0 não processados" em todo run só polui — mesma regra da linha de imóveis
+	// órfãos em scraper.
+	counts := fmt.Sprintf("%d enriquecidos, %d pulados, %d com erro", summary.Enriched, summary.Skipped, summary.Failed)
+	if unprocessed > 0 {
+		counts += fmt.Sprintf(", %d não processados", unprocessed)
+	}
+
+	message := fmt.Sprintf("enriquecimento %s: %d anúncios enfileirados (%s)", verb, summary.Queued, counts)
 
 	attrs := []any{
 		"queued", summary.Queued,
 		"enriched", summary.Enriched,
 		"skipped", summary.Skipped,
 		"failed", summary.Failed,
+		"unprocessed", unprocessed,
 		"workers", p.deps.Workers,
 	}
 

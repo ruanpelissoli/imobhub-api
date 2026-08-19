@@ -230,7 +230,10 @@ compartilhado com `ai`, `selectors` e `scraper` — nenhum outro pacote monta SQ
   `IS DISTINCT FROM` com `last_seen_at` incondicional, e que o predicado de
   `selectPendingListingsSQL` continua idêntico ao do índice parcial de
   `migrations/006` (divergir faz o índice deixar de ser usado em silêncio, e a
-  fila volta a varrer a tabela inteira). Esses são os bugs
+  fila volta a varrer a tabela inteira). As três regras foram confirmadas contra
+  um PostgreSQL 17 real: upsert do **mesmo** payload não bumpa `updated_at` e
+  renova `last_seen_at`; upsert com `price_raw` alterado bumpa; e o `EXPLAIN` da
+  fila usa `idx_listings_enrichment_queue`. Esses são os bugs
   mais caros e mais invisíveis do pacote: só se manifestariam meses depois, como
   "o catálogo inteiro é reprocessado (e repago) todo dia" ou "este anúncio nunca
   sai da fila". A verificação em PostgreSQL real de "anúncio inalterado não bumpa

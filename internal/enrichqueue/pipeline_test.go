@@ -1,9 +1,13 @@
 package enrichqueue
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 
@@ -358,6 +362,89 @@ func TestRunFailsWhenTheQueueCannotBeRead(t *testing.T) {
 
 	if _, err := stub.run(t, context.Background()); err == nil {
 		t.Fatal("Run() error = nil, want error")
+	}
+}
+
+// captureLogs redireciona o logger padrão para um buffer pelo tempo do teste.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+
+	buffer := &bytes.Buffer{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(buffer, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	return buffer
+}
+
+// Num run cancelado, `queued` é somado na leitura do lote e os anúncios que
+// nunca chegaram a um worker não entram em nenhum dos três contadores. Sem
+// `unprocessed`, quem somasse as colunas do resumo acharia que sumiram anúncios.
+func TestLogSummaryAccountsForUnprocessedListings(t *testing.T) {
+	stub := newStub(nil)
+	pipeline, err := New(stub.Deps)
+	if err != nil {
+		t.Fatalf("New() error = %v, want nil", err)
+	}
+
+	logs := captureLogs(t)
+	summary := Summary{Queued: 200, Enriched: 37, Skipped: 0, Failed: 0}
+	pipeline.logSummary(context.Background(), summary, true)
+
+	var entry struct {
+		Level       string `json:"level"`
+		Message     string `json:"msg"`
+		Queued      int    `json:"queued"`
+		Unprocessed int    `json:"unprocessed"`
+	}
+	if err := json.Unmarshal(logs.Bytes(), &entry); err != nil {
+		t.Fatalf("log não é JSON: %v (%s)", err, logs.String())
+	}
+
+	if got, want := entry.Unprocessed, 163; got != want {
+		t.Errorf("unprocessed = %d, want %d", got, want)
+	}
+	if entry.Queued != summary.Enriched+summary.Skipped+summary.Failed+entry.Unprocessed {
+		t.Errorf("o resumo não fecha: queued = %d, soma das colunas = %d",
+			entry.Queued, summary.Enriched+summary.Skipped+summary.Failed+entry.Unprocessed)
+	}
+	if got, want := entry.Level, "WARN"; got != want {
+		t.Errorf("level = %q, want %q — run interrompido não é Info", got, want)
+	}
+	if !strings.Contains(entry.Message, "interrompido") || !strings.Contains(entry.Message, "163 não processados") {
+		t.Errorf("mensagem = %q, want menção a interrompido e aos não processados", entry.Message)
+	}
+}
+
+// Num run completo o número é sempre zero, e a menção a ele na mensagem humana
+// só poluiria — o atributo estruturado continua saindo, para quem soma colunas.
+func TestLogSummaryOmitsUnprocessedFromTheMessageOfACompleteRun(t *testing.T) {
+	stub := newStub(nil)
+	pipeline, err := New(stub.Deps)
+	if err != nil {
+		t.Fatalf("New() error = %v, want nil", err)
+	}
+
+	logs := captureLogs(t)
+	pipeline.logSummary(context.Background(), Summary{Queued: 3, Enriched: 2, Skipped: 1}, false)
+
+	var entry struct {
+		Level       string `json:"level"`
+		Message     string `json:"msg"`
+		Unprocessed int    `json:"unprocessed"`
+	}
+	if err := json.Unmarshal(logs.Bytes(), &entry); err != nil {
+		t.Fatalf("log não é JSON: %v (%s)", err, logs.String())
+	}
+
+	if entry.Unprocessed != 0 {
+		t.Errorf("unprocessed = %d, want 0", entry.Unprocessed)
+	}
+	if strings.Contains(entry.Message, "não processados") {
+		t.Errorf("mensagem = %q, não deve citar não processados num run completo", entry.Message)
+	}
+	if got, want := entry.Level, "INFO"; got != want {
+		t.Errorf("level = %q, want %q", got, want)
 	}
 }
 

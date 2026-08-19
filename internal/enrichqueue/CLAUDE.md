@@ -76,7 +76,13 @@ liga — não duplique nada disso por enricher.
   nenhuma goroutine vaza.
 - O resumo final segue o formato do `logSummary` do scraper: mensagem humana
   (`enriquecimento concluído: N anúncios enfileirados (...)`) mais os atributos
-  estruturados `queued`/`enriched`/`skipped`/`failed`/`workers`.
+  estruturados `queued`/`enriched`/`skipped`/`failed`/`unprocessed`/`workers`.
+- **`queued` não fecha com a soma dos três contadores num run interrompido.** Ele
+  é somado na **leitura** do lote, antes de processá-lo; os anúncios que nunca
+  chegaram a um worker são `outcomeAborted` e não entram em contador nenhum.
+  `unprocessed` (`queued − enriched − skipped − failed`) existe para fechar a
+  conta, e aparece na mensagem humana **só quando é maior que zero** — num run
+  completo ele é sempre zero e a linha só poluiria.
 
 ## Dependencies
 `internal/config` (`EnrichmentWorkers`, `AmenitiesFile`, as variáveis de
@@ -121,13 +127,28 @@ Consumido por `cmd/scraper`, que só chama `RunEnrichment`.
 - O teste de integração é pulado com `-short` ou sem `DATABASE_URL`, e usa o
   Postgres do `docker-compose.yml` (serviço `db`). Não há testcontainers — a
   ausência é decisão registrada em `internal/db/CLAUDE.md`.
-- **O teste de integração precisa filtrar a fila pelo domínio de teste**
-  (`pendingForTestDomain`), e o filtro **pagina por dentro**. `pipeline.Run`
-  drena tudo o que o `ListPending` devolver, e ali embaixo estão o
-  `db.UpdateListingEnrichment` e o `MarkListingEnriched` de verdade: sem o
-  filtro, um banco de desenvolvimento que já rodou `go run ./cmd/scraper` teria
-  todo anúncio pendente recebendo as coordenadas fixas do stub, agrupado à força
-  pelo matcher e carimbado — e o cleanup, que apaga só por `source_domain`, não
-  desfaria nada. Filtrar **depois** do `LIMIT` não resolve: o lote viria vazio
-  sempre que as linhas do teste não coubessem nas primeiras da tabela, e `Run`
-  encerraria achando que a fila acabou.
+- **O isolamento do teste de integração tem dois lados, e os dois são
+  obrigatórios.** A partir de `GroupListing` o wiring é o de produção de verdade
+  (`grouper.GroupListing`, `MergePropertyData`, `db.UpdateListingEnrichment`,
+  `MarkListingEnriched`), então o teste **escreve** no banco de desenvolvimento:
+
+  1. **A fila que ele lê** — `pendingForTestDomain` filtra por
+     `source_domain`, e **pagina por dentro**. Sem o filtro, todo anúncio
+     pendente receberia as coordenadas fixas do stub, seria agrupado à força e
+     carimbado. Filtrar **depois** do `LIMIT` não resolve: o lote viria vazio
+     sempre que as linhas do teste não coubessem nas primeiras da tabela, e `Run`
+     encerraria achando que a fila acabou. O passo da varredura
+     (`scanPageSize`) é separado do `limit` pedido pelo pipeline, senão a
+     varredura faria uma ida ao banco a cada 10 linhas da fila real.
+  2. **O raio em que ele agrupa** — `testLat`/`testLng` ficam no meio do
+     Atlântico Sul. `alwaysSamePropertyMatcher` aceita `candidates[0]` sem saber
+     se ele é do teste ou do catálogo, então o único isolamento possível é não
+     existir candidato real dentro de `RadiusMeters`. Uma coordenada plausível
+     (o centro de Brasília, onde o Nominatim deposita endereço impreciso do DF)
+     vincularia um anúncio de mentira a uma property real, a reconsolidaria com
+     as fotos do seed e o cleanup a apagaria — deixando os anúncios reais dela
+     com `property_id` NULL **e `enriched_at` carimbado**, invisíveis para a fila.
+
+  O `cleanup` tem o cinto de segurança correspondente: captura os ids, apaga os
+  anúncios do teste e só então remove, dos ids capturados, **os que ficaram sem
+  nenhum anúncio**. Nunca apaga uma property com anúncio de terceiro.
