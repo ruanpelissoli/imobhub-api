@@ -85,8 +85,24 @@ tabelas são o contrato que todas as queries `pgx` assumem.
   `updated_at` condicionalmente** (`IS DISTINCT FROM` campo a campo): com o
   `NOW()` incondicional que existia antes, o catálogo inteiro voltava à fila
   todo dia. Ver `internal/db/CLAUDE.md`.
-- `idx_listings_pending_enrichment` (`005`) é **parcial**, sobre
-  `(id) WHERE enriched_at IS NULL`. Ele cobre só o ramo "nunca enriquecido" — o
-  outro (`updated_at > enriched_at`) compara duas colunas da mesma linha e
-  nenhum btree o atende. Não tente "consertar" isso com um índice composto:
-  quem segura esse ramo é a guarda no upsert, não o índice.
+- **O índice da fila é `idx_listings_enrichment_queue` (`006`), não o
+  `idx_listings_pending_enrichment` do `005`.** O do `005` era
+  `(id) WHERE enriched_at IS NULL` e **nunca seria usado**: o PostgreSQL só
+  aproveita um índice parcial quando consegue provar que o resultado da query
+  satisfaz o predicado do índice, e o `OR` da fila
+  (`enriched_at IS NULL OR updated_at > enriched_at`) torna essa prova
+  impossível — o segundo ramo não tem índice, não há BitmapOr a montar e o
+  planner cai num scan de `listings_pkey` com filtro. Era custo de manutenção na
+  tabela mais quente do schema sem ganho de leitura. O `006` derruba aquele e
+  cria um cujo predicado é **idêntico** ao da query, o que torna a implicação
+  trivial. O comentário dentro do arquivo `005` está superado; ele não pode ser
+  editado (migrations são imutáveis) e a correção vive no `006`.
+- **O predicado de `idx_listings_enrichment_queue` precisa continuar idêntico ao
+  WHERE de `selectPendingListingsSQL`.** Se um dos dois mudar sozinho, o índice
+  deixa de ser usado **em silêncio**: a query continua correta e volta a varrer a
+  tabela inteira. `TestEnrichmentQueueIndexPredicateMatchesTheQuery`
+  (`internal/db`) compara os dois textos justamente para flagrar isso.
+- Comparação de `timestamptz` é `IMMUTABLE`, então ela é aceita num predicado de
+  índice parcial. O que **não** seria aceito é `now()` ou um cast dependente de
+  fuso — se o predicado da fila algum dia virar "enriquecido nos últimos N dias",
+  ele não pode ir para um índice.

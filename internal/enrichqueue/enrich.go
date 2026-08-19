@@ -64,6 +64,16 @@ func (p *Pipeline) processListing(ctx context.Context, listing db.PendingListing
 		Amenities:              extracted.Amenities,
 	}
 
+	// A geocodificação roda **mesmo quando o anúncio já tem coordenadas**. É
+	// deliberado e mais caro do que o mínimo: `address_raw` não é o único campo
+	// que devolve o anúncio à fila (`price_raw` também bumpa `updated_at`), então
+	// um anúncio que só mudou de preço é regeocodificado sem necessidade, a 1s de
+	// fila global. Reusar o par antigo evitaria esse custo, mas `listings` não
+	// guarda o endereço do passe anterior — não há como distinguir "só o preço
+	// mudou" de "o endereço foi corrigido", e manter uma coordenada obsoleta
+	// depois de uma correção de endereço é o erro caro (ela alimenta o
+	// agrupamento). O projeto já escolheu esse lado: "gravar um ponto errado é
+	// pior que não gravar nada" (enrichment/geocoder.go).
 	lat, lng, err := p.deps.Geocode(ctx, listing.AddressRaw, "", "")
 	switch {
 	case err == nil:
@@ -72,23 +82,25 @@ func (p *Pipeline) processListing(ctx context.Context, listing db.PendingListing
 
 	case errors.Is(err, enrichment.ErrAddressNotFound), errors.Is(err, enrichment.ErrEmptyAddress):
 		// **Não é falha**: o endereço não é resolvível, não é que não deu para
-		// perguntar. lat/lng ficam NULL, o agrupamento é pulado (um canônico sem
-		// geo nunca mais casa com nada) e o anúncio **é carimbado** — o geocoder
-		// faz negative caching, então repetir a pergunta a cada run não muda o
-		// resultado e só gasta quota.
-		slog.InfoContext(ctx, "anúncio sem endereço resolvível: geocodificação e agrupamento pulados",
+		// perguntar. O anúncio **é carimbado** — o geocoder faz negative caching,
+		// então repetir a pergunta a cada run não muda o resultado e só gasta
+		// quota.
+		//
+		// As coordenadas de um passe anterior são **preservadas**, não apagadas.
+		// ErrAddressNotFound nasce de um 200 com zero resultados, que o provider
+		// devolve ocasionalmente para endereços que já resolveu antes: gravar
+		// NULL por cima seria perder um geocode bom **e** carimbar, ou seja, sem
+		// nova tentativa. É o mesmo cuidado que o ramo transitório abaixo toma.
+		enriched.Lat = listing.Lat
+		enriched.Lng = listing.Lng
+
+		slog.InfoContext(ctx, "endereço do anúncio não resolvido pelo provider de geocodificação",
 			"listing_id", listing.ID,
 			"source_domain", listing.SourceDomain,
 			"listing_url", listing.ListingURL,
+			"coordinates_preserved", enriched.Lat != nil && enriched.Lng != nil,
 			"error", err,
 		)
-		if !p.save(ctx, listing, enriched) {
-			return p.outcomeFor(ctx, outcomeFailed)
-		}
-		if !p.markEnriched(ctx, listing) {
-			return p.outcomeFor(ctx, outcomeFailed)
-		}
-		return p.outcomeFor(ctx, outcomeSkipped)
 
 	default:
 		// Rede, timeout ou status >= 400: transitório. Nada é persistido — um
@@ -101,6 +113,17 @@ func (p *Pipeline) processListing(ctx context.Context, listing db.PendingListing
 
 	if !p.save(ctx, listing, enriched) {
 		return p.outcomeFor(ctx, outcomeFailed)
+	}
+
+	// Sem coordenadas não há agrupamento: um canônico sem geo nunca mais aparece
+	// numa busca por raio e, portanto, nunca mais casa com nada (contrato de
+	// grouping.ErrListingNotGeocoded). O anúncio sai da fila mesmo assim — ver o
+	// negative caching acima.
+	if enriched.Lat == nil || enriched.Lng == nil {
+		if !p.markEnriched(ctx, listing) {
+			return p.outcomeFor(ctx, outcomeFailed)
+		}
+		return p.outcomeFor(ctx, outcomeSkipped)
 	}
 
 	propertyID, isNew, err := p.deps.GroupListing(ctx, groupingListing(listing, enriched))

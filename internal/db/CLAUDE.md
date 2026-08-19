@@ -225,9 +225,12 @@ compartilhado com `ai`, `selectors` e `scraper` — nenhum outro pacote monta SQ
 
 - Os testes deste pacote **não tocam no banco**: cobrem só as funções puras
   (montagem de argumentos, validação, JSON, bounding box/haversine, agregação de
-  `staleCountsByProperty`) e dois **contratos em string** — que o SQL de
-  enriquecimento não menciona `updated_at` e que o upsert mantém a guarda
-  `IS DISTINCT FROM` com `last_seen_at` incondicional. Esses dois são os bugs
+  `staleCountsByProperty`) e três **contratos em string** — que o SQL de
+  enriquecimento não menciona `updated_at`, que o upsert mantém a guarda
+  `IS DISTINCT FROM` com `last_seen_at` incondicional, e que o predicado de
+  `selectPendingListingsSQL` continua idêntico ao do índice parcial de
+  `migrations/006` (divergir faz o índice deixar de ser usado em silêncio, e a
+  fila volta a varrer a tabela inteira). Esses são os bugs
   mais caros e mais invisíveis do pacote: só se manifestariam meses depois, como
   "o catálogo inteiro é reprocessado (e repago) todo dia" ou "este anúncio nunca
   sai da fila". A verificação em PostgreSQL real de "anúncio inalterado não bumpa

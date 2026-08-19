@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -375,4 +377,64 @@ func TestUpsertListingSQLBumpsUpdatedAtOnlyOnRealChanges(t *testing.T) {
 	if !strings.Contains(upsertListingSQL, "last_seen_at    = NOW()") {
 		t.Errorf("upsertListingSQL não renova last_seen_at incondicionalmente:\n%s", upsertListingSQL)
 	}
+}
+
+// O índice da fila (migrations/006) é um índice **parcial** cujo predicado
+// precisa ser idêntico ao WHERE de selectPendingListingsSQL: o PostgreSQL só usa
+// um parcial quando consegue provar que o resultado da query satisfaz o
+// predicado do índice, e com expressões iguais essa prova é trivial. Se um dos
+// dois textos mudar sozinho, o índice para de ser usado **em silêncio** — a
+// query continua correta e volta a varrer a tabela inteira, o pior tipo de
+// regressão de performance. Este teste é a única coisa que segura isso sem um
+// PostgreSQL na mão.
+func TestEnrichmentQueueIndexPredicateMatchesTheQuery(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "migrations", "006_fix_enrichment_queue_index.sql"))
+	if err != nil {
+		t.Fatalf("leitura da migration: %v", err)
+	}
+
+	predicate := indexPredicateOf(t, string(raw))
+	if predicate == "" {
+		t.Fatal("não foi possível extrair o predicado do CREATE INDEX da migration 006")
+	}
+
+	// O predicado aparece entre parênteses na query, porque lá ele é combinado
+	// com o cursor por AND.
+	if want := "(" + predicate + ")"; !strings.Contains(collapseSpaces(selectPendingListingsSQL), want) {
+		t.Errorf("o predicado do índice e o da query divergiram; o índice deixará de ser usado.\níndice: %s\nquery:  %s",
+			predicate, collapseSpaces(selectPendingListingsSQL))
+	}
+}
+
+// indexPredicateOf devolve o predicado do CREATE INDEX, já com espaços
+// colapsados. As linhas de comentário são descartadas primeiro: elas citam o
+// predicado antigo e casariam por engano.
+func indexPredicateOf(t *testing.T, migration string) string {
+	t.Helper()
+
+	var statements []string
+	for _, line := range strings.Split(migration, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		statements = append(statements, line)
+	}
+
+	sql := collapseSpaces(strings.Join(statements, " "))
+	_, after, found := strings.Cut(sql, "CREATE INDEX")
+	if !found {
+		return ""
+	}
+	_, predicate, found := strings.Cut(after, " WHERE ")
+	if !found {
+		return ""
+	}
+
+	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(predicate), ";"))
+}
+
+// collapseSpaces reduz qualquer sequência de espaços em branco a um espaço só,
+// para que a comparação não dependa da indentação de cada arquivo.
+func collapseSpaces(sql string) string {
+	return strings.Join(strings.Fields(sql), " ")
 }

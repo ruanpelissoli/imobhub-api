@@ -49,17 +49,25 @@ liga — não duplique nada disso por enricher.
   | Situação | Persiste campos | Agrupa/merge | Carimba `enriched_at` | Contador |
   |---|---|---|---|---|
   | Caminho feliz | sim | sim | **sim** | `Enriched` |
-  | `enrichment.ErrAddressNotFound` / `ErrEmptyAddress` | sim, `lat`/`lng` NULL | não | **sim** | `Skipped` |
+  | `ErrAddressNotFound`/`ErrEmptyAddress`, **sem** geo anterior | sim, `lat`/`lng` NULL | não | **sim** | `Skipped` |
+  | `ErrAddressNotFound`/`ErrEmptyAddress`, **com** geo anterior | sim, **preserva** o par | sim | **sim** | `Enriched` |
   | Rede/timeout/status do geocoder | **não** | não | **não** | `Failed` |
   | `grouping.ErrListingNotGeocoded` | sim | não | sim | `Skipped` |
   | Erro da IA em `GroupListing` | sim | — | **não** | `Failed` |
   | Erro em `MergeProperty` | sim | vínculo já gravado | **não** | `Failed` |
   | `ctx` cancelado | — | — | não | nenhum (`outcomeAborted`) |
 
-  As duas linhas que não são óbvias: endereço irresolvível **é carimbado** porque
-  o geocoder faz negative caching e reperguntar não muda o resultado; erro
+  As linhas que não são óbvias: endereço irresolvível **é carimbado** porque o
+  geocoder faz negative caching e reperguntar não muda o resultado; erro
   **transitório não persiste nada** porque um `UPDATE` gravaria `lat`/`lng` NULL
-  por cima de um geocode válido de um passe anterior.
+  por cima de um geocode válido de um passe anterior; e `ErrAddressNotFound`
+  **preserva** as coordenadas de um passe anterior pelo mesmo motivo — ele nasce
+  de um 200 com zero resultados, que o provider devolve ocasionalmente para
+  endereços que já resolveu, e apagar um geocode bom **e** carimbar deixaria o
+  anúncio sem coordenadas e sem nova tentativa.
+- **Quem decide se há agrupamento é `enriched.Lat`/`Lng`, não o ramo do
+  `switch`.** É o que faz as duas linhas de `ErrAddressNotFound` acima caírem em
+  desfechos diferentes sem duplicar o fluxo.
 - **Erro só é fatal em dois casos**: leitura da fila impossível e contexto
   cancelado. Anúncio que falha vira `slog.Error` com `listing_id`/`source_domain`
   e a fila segue.
@@ -84,6 +92,19 @@ Consumido por `cmd/scraper`, que só chama `RunEnrichment`.
   serializa em 1 req/s global pelo `DomainLimiter` compartilhado; quem realmente
   paraleliza são as chamadas de IA do agrupamento — que são **pagas por anúncio**.
   Subir `ENRICHMENT_WORKERS` aumenta o custo por unidade de tempo, não o total.
+- **O anúncio é regeocodificado mesmo quando já tem `lat`/`lng`, de propósito, e
+  isso é mais caro do que o mínimo.** `address_raw` não é o único campo que
+  devolve o anúncio à fila: `price_raw` também bumpa `updated_at`, e preço é o
+  que mais muda em portal imobiliário — então N anúncios com preço novo custam
+  N segundos de fila global por dia (o cache do geocoder é por endereço, e cada
+  anúncio tem o seu). Reusar o par gravado eliminaria esse custo, **mas**
+  `listings` não guarda o endereço do passe anterior: não há como distinguir "só
+  o preço mudou" de "o endereço foi corrigido", e manter coordenada obsoleta
+  depois de uma correção de endereço é o erro caro — ela alimenta o agrupamento,
+  que é pago e difícil de desfazer. O projeto já escolheu esse lado ("gravar um
+  ponto errado é pior que não gravar nada", `enrichment/geocoder.go`). Se um dia
+  `listings` ganhar um hash do `address_raw` geocodificado, a saída barata passa
+  a ser segura e é aqui que ela entra.
 - **A correção do `updated_at` em `upsertListingSQL` é o que segura o custo
   desta fila.** Se ela for revertida, o predicado `updated_at > enriched_at`
   casa com o catálogo inteiro todo dia e o passe pago de IA se repete
@@ -100,3 +121,13 @@ Consumido por `cmd/scraper`, que só chama `RunEnrichment`.
 - O teste de integração é pulado com `-short` ou sem `DATABASE_URL`, e usa o
   Postgres do `docker-compose.yml` (serviço `db`). Não há testcontainers — a
   ausência é decisão registrada em `internal/db/CLAUDE.md`.
+- **O teste de integração precisa filtrar a fila pelo domínio de teste**
+  (`pendingForTestDomain`), e o filtro **pagina por dentro**. `pipeline.Run`
+  drena tudo o que o `ListPending` devolver, e ali embaixo estão o
+  `db.UpdateListingEnrichment` e o `MarkListingEnriched` de verdade: sem o
+  filtro, um banco de desenvolvimento que já rodou `go run ./cmd/scraper` teria
+  todo anúncio pendente recebendo as coordenadas fixas do stub, agrupado à força
+  pelo matcher e carimbado — e o cleanup, que apaga só por `source_domain`, não
+  desfaria nada. Filtrar **depois** do `LIMIT` não resolve: o lote viria vazio
+  sempre que as linhas do teste não coubessem nas primeiras da tabela, e `Run`
+  encerraria achando que a fila acabou.

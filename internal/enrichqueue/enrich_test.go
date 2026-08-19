@@ -157,6 +157,82 @@ func TestProcessListingSkipsAndStampsUnresolvableAddresses(t *testing.T) {
 	}
 }
 
+// ErrAddressNotFound pode ser espúrio: nasce de um 200 com zero resultados, que
+// o provider devolve ocasionalmente para endereços que já resolveu. Apagar um
+// geocode bom **e** carimbar deixaria o anúncio sem coordenadas e sem nova
+// tentativa — por isso o par anterior é preservado, e o agrupamento continua.
+func TestProcessListingPreservesPreviousCoordinatesWhenTheAddressStopsResolving(t *testing.T) {
+	pending := samplePending(1)
+	previousLat, previousLng := -15.7942, -47.8822
+	pending[0].Lat = &previousLat
+	pending[0].Lng = &previousLng
+
+	stub := newStub(pending)
+	stub.Deps.Geocode = func(context.Context, string, string, string) (float64, float64, error) {
+		return 0, 0, fmt.Errorf("enrichment: geocoding: %w", enrichment.ErrAddressNotFound)
+	}
+
+	summary, err := stub.run(t, context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	// Com coordenadas válidas o anúncio segue o caminho feliz: ele **tem** geo,
+	// só não conseguiu confirmá-la agora.
+	if got, want := summary.Enriched, 1; got != want {
+		t.Errorf("summary.Enriched = %d, want %d", got, want)
+	}
+
+	stub.snapshot(func(s *stubDeps) {
+		if len(s.saved) != 1 {
+			t.Fatalf("len(saved) = %d, want 1", len(s.saved))
+		}
+		if s.saved[0].Lat == nil || *s.saved[0].Lat != previousLat {
+			t.Errorf("lat gravada = %v, want %v — o geocode anterior não pode ser apagado", s.saved[0].Lat, previousLat)
+		}
+		if s.saved[0].Lng == nil || *s.saved[0].Lng != previousLng {
+			t.Errorf("lng gravada = %v, want %v", s.saved[0].Lng, previousLng)
+		}
+		if len(s.grouped) != 1 {
+			t.Fatalf("len(grouped) = %d, want 1 — o anúncio tem coordenadas e deve ser agrupado", len(s.grouped))
+		}
+		if got, want := s.marked, []int64{1}; !reflect.DeepEqual(got, want) {
+			t.Errorf("marked = %v, want %v", got, want)
+		}
+	})
+}
+
+// O regeocode acontece mesmo com coordenadas já gravadas: `price_raw` também
+// devolve o anúncio à fila, e `listings` não guarda o endereço do passe anterior
+// para distinguir "só o preço mudou" de "o endereço foi corrigido". A decisão é
+// deliberada (correção acima de custo) e está registrada no CLAUDE.md.
+func TestProcessListingRegeocodesListingsThatAlreadyHaveCoordinates(t *testing.T) {
+	pending := samplePending(1)
+	stale := -1.0
+	pending[0].Lat = &stale
+	pending[0].Lng = &stale
+
+	stub := newStub(pending)
+
+	var geocoded int
+	stub.Deps.Geocode = func(context.Context, string, string, string) (float64, float64, error) {
+		geocoded++
+		return -15.78, -47.93, nil
+	}
+
+	if _, err := stub.run(t, context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if got, want := geocoded, 1; got != want {
+		t.Fatalf("Geocode chamado %d vezes, want %d", got, want)
+	}
+
+	stub.snapshot(func(s *stubDeps) {
+		if s.saved[0].Lat == nil || *s.saved[0].Lat != -15.78 {
+			t.Errorf("lat gravada = %v, want -15.78 (a coordenada nova vence a antiga)", s.saved[0].Lat)
+		}
+	})
+}
+
 // Erro transitório do geocoder (rede, timeout, status >= 400) não persiste nada
 // e não carimba: gravar lat/lng NULL apagaria um geocode válido de um passe
 // anterior, e o próximo run precisa tentar de novo.

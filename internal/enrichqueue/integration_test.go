@@ -56,7 +56,7 @@ func TestEnrichmentPipelineGroupsTwoListingsIntoOneProperty(t *testing.T) {
 
 	pipeline, err := New(Deps{
 		ListPending: func(ctx context.Context, afterID int64, limit int) ([]db.PendingListing, error) {
-			return db.ListPendingListings(ctx, pool, afterID, limit)
+			return pendingForTestDomain(ctx, pool, afterID, limit)
 		},
 		NormalizeNeighborhood: normalizer.Normalize,
 		ExtractTerms: func(string) enrichment.ExtractedData {
@@ -100,15 +100,54 @@ func TestEnrichmentPipelineGroupsTwoListingsIntoOneProperty(t *testing.T) {
 
 	// A fila precisa vir vazia num segundo passe: se o UPDATE de enriquecimento
 	// tocasse updated_at, os mesmos anúncios voltariam aqui para sempre.
-	pending, err := db.ListPendingListings(ctx, pool, 0, 10)
+	pending, err := pendingForTestDomain(ctx, pool, 0, 10)
 	if err != nil {
 		t.Fatalf("ListPendingListings() error = %v, want nil", err)
 	}
-	for _, listing := range pending {
-		if listing.SourceDomain == testSourceDomain {
-			t.Fatalf("anúncio %d voltou à fila depois de enriquecido", listing.ID)
+	if len(pending) != 0 {
+		t.Fatalf("%d anúncios voltaram à fila depois de enriquecidos", len(pending))
+	}
+}
+
+// pendingForTestDomain devolve apenas os anúncios pendentes do domínio de teste.
+//
+// **O filtro é o que isola o teste do catálogo real.** `pipeline.Run` drena a
+// fila que este closure devolve, e os stubs abaixo dele são o
+// `db.UpdateListingEnrichment` de verdade: sem o filtro, todo anúncio pendente
+// de um banco de desenvolvimento que já rodou `go run ./cmd/scraper` receberia
+// as coordenadas fixas do stub, seria agrupado à força pelo matcher e sairia
+// carimbado da fila — e o cleanup, que apaga só por `source_domain`, não
+// desfaria nada disso.
+//
+// A paginação interna é necessária, e não é preciosismo: filtrar **depois** do
+// LIMIT devolveria um lote vazio sempre que as linhas do teste não coubessem nas
+// `limit` primeiras da tabela inteira, e `Run` encerraria achando que a fila
+// acabou. O laço avança o cursor pelo maior id **visto**, não pelo maior id do
+// domínio de teste, então ele termina quando a fila real se esgota.
+//
+// `db.ListPendingListings` continua no caminho de propósito: o predicado da fila
+// é justamente o que este teste existe para exercitar contra o PostgreSQL.
+func pendingForTestDomain(ctx context.Context, pool *pgxpool.Pool, afterID int64, limit int) ([]db.PendingListing, error) {
+	mine := make([]db.PendingListing, 0, limit)
+
+	for len(mine) < limit {
+		batch, err := db.ListPendingListings(ctx, pool, afterID, limit)
+		if err != nil {
+			return nil, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		afterID = batch[len(batch)-1].ID
+
+		for _, listing := range batch {
+			if listing.SourceDomain == testSourceDomain {
+				mine = append(mine, listing)
+			}
 		}
 	}
+
+	return mine, nil
 }
 
 // assertOneGroupedProperty verifica o estado final: um único imóvel canônico,
