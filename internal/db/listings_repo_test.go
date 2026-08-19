@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"reflect"
@@ -124,6 +125,21 @@ func TestListingArgsRejectsUnserializableExtraData(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "https://exemplo.com.br/1") {
 		t.Errorf("listingArgs() error = %q, want it to mention the listing URL", err)
+	}
+}
+
+// A guarda de id vazio precisa valer antes de qualquer ida ao banco: com um
+// pool nil, chegar à query seria panic — é assim que o teste prova que ela
+// existe.
+func TestListListingsByPropertyIDRejectsBlankPropertyID(t *testing.T) {
+	for _, id := range []string{"", "   "} {
+		_, err := ListListingsByPropertyID(context.Background(), nil, id)
+		if err == nil {
+			t.Fatalf("ListListingsByPropertyID(%q) error = nil, want an error", id)
+		}
+		if !strings.Contains(err.Error(), "property id is required") {
+			t.Errorf("error = %q, want it to mention the missing property id", err)
+		}
 	}
 }
 

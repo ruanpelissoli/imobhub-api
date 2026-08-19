@@ -1,10 +1,17 @@
 # internal/grouping
 
 ## Purpose
-Decide se um anúncio já normalizado e geocodificado se refere ao mesmo imóvel
-físico de algum registro canônico em `properties` — vinculando-o ao existente
-ou criando um novo. `PropertyGrouper.GroupListing` é a única porta de entrada e
-devolve `(propertyID string, isNew bool, err error)`.
+Duas responsabilidades sobre o imóvel canônico, ambas em `PropertyGrouper`:
+
+1. **Agrupar** (`grouper.go`) — decide se um anúncio já normalizado e
+   geocodificado se refere ao mesmo imóvel físico de algum registro em
+   `properties`, vinculando-o ao existente ou criando um novo.
+   `GroupListing` devolve `(propertyID string, isNew bool, err error)`.
+2. **Consolidar** (`merger.go`) — `MergePropertyData(ctx, propertyID)`
+   reconsolida o canônico a partir de **todos** os anúncios vinculados a ele:
+   fotos, descrição, comodidades e quartos. Existe porque `propertyFrom` só
+   enxerga o anúncio que criou o registro; sem esta passagem o canônico ficaria
+   congelado nos dados do primeiro anúncio.
 
 É o par de `internal/selectors` do lado do enriquecimento: orquestra
 `internal/ai` (a decisão) e `internal/db` (a persistência).
@@ -14,7 +21,8 @@ devolve `(propertyID string, isNew bool, err error)`.
   nem `ai` por decisão registrada em `internal/CLAUDE.md`; os enrichers de lá
   são funções puras/HTTP. O precedente correto para "orquestra `ai` + `db`" é
   `internal/selectors`.
-- **Interfaces declaradas no consumidor** (`PropertyStore`, `PropertyMatcher`).
+- **Interfaces declaradas no consumidor** (`PropertyStore` — 6 métodos: 3 para o
+  agrupamento, 3 para a consolidação — e `PropertyMatcher`).
   `internal/db` expõe funções livres sobre `*pgxpool.Pool` e **não** ganha
   struct nem interface de repositório (ver `internal/db/CLAUDE.md`);
   `store.go` é o adaptador fino e o único ponto do pacote que conhece `pgxpool`.
@@ -53,16 +61,51 @@ devolve `(propertyID string, isNew bool, err error)`.
   `listings` não tem essas colunas e `AreaRaw` é texto livre que este pacote
   **não** parseia.
 
+### Consolidação (`MergePropertyData`)
+- **`db.UpdateProperty` reescreve TODAS as colunas consolidadas.** Por isso o
+  fluxo é **read-modify-write**: lê o canônico, sobrescreve só os quatro campos
+  deste merge e regrava o struct inteiro. Montar um `db.Property` apenas com
+  `Photos`/`Description` apagaria endereço, bairro, cidade, estado, lat/lng e
+  área — e um canônico sem geo nunca mais casa com nada em
+  `FindPropertiesByCoordinates`. `active_listing_count` e `created_at` são
+  preservados pelo próprio SQL, e `updated_at = NOW()` também (não há trigger).
+- **Zero anúncios é no-op sem erro** (o vínculo pode ter acabado de ser
+  desfeito); property inexistente é `ErrPropertyNotFound`.
+- **Ordem determinística é invariante, não estilo.** Os anúncios chegam de
+  `db.ListListingsByPropertyID` ordenados por `listings.id`, e a ordem original
+  de cada array é mantida. É isso que faz o corte em `maxMergedPhotos = 50`
+  escolher sempre as **mesmas** 50 fotos e sustenta a idempotência.
+- **Dedup de fotos por igualdade exata**, sem normalizar barra final ou query
+  string: num CDN elas costumam distinguir recortes/tamanhos, e descartar o
+  "duplicado" errado perderia a única versão utilizável.
+- **Fotos e comodidades são substituídas**, não unidas com o que já estava no
+  canônico: os anúncios são a fonte, e uma foto que sumiu de todos eles não deve
+  sobreviver. **A descrição é a exceção**: um texto já consolidado só é trocado
+  por outro, nunca apagado quando nenhum anúncio tem texto.
+- **Descrição = a mais longa, contada em runes.** Heurística assumida (o texto
+  maior costuma trazer planta, condomínio e proximidades) e sem gastar IA. Runes
+  porque os textos são pt-BR: em bytes, o mesmo texto "cresceria" só por estar
+  acentuado. A comparação é estritamente maior, então empate fica com o menor
+  `listings.id`.
+- **`BedroomCount` = voto de maioria** entre os anúncios que informam, empate
+  pelo valor de menor `id`. Maioria (e não "o anúncio mais recente") porque o
+  dado vem de parser sobre texto livre: um erro isolado não deve reescrever o
+  que dois portais confirmam. `nil` quando **nenhum** informa — nunca `0`.
+- `transaction_type` e `property_type` **não** entram no merge: essas colunas não
+  existem em `listings` (ver "a v1 não distingue venda de aluguel" abaixo).
+
 ## Dependencies
 `internal/ai` (`MatchProperty`, `MatchListing`, `PropertyMatch`), `internal/db`
-(`Property` e as três funções adaptadas em `store.go`) e `pgxpool` — este
-último só em `store.go`. Os parâmetros vêm de `internal/config`
+(`Property`, `Listing` e as seis funções adaptadas em `store.go`) e `pgxpool` —
+este último só em `store.go`. Os parâmetros vêm de `internal/config`
 (`GroupingConfidenceThreshold`, `GroupingRadiusMeters`, `GroupingMaxCandidates`).
 
-**Ainda não tem chamador.** Como os enrichers de `internal/enrichment`, o
-serviço nasce desconectado: a fila por `enriched_at IS NULL`, a leitura dos
-anúncios pendentes e o wiring em `cmd/scraper` são a task de follow-up
-**compartilhada** — não duplique esse plumbing aqui.
+**Ainda não tem chamador** — nem `GroupListing` nem `MergePropertyData`. Como os
+enrichers de `internal/enrichment`, o serviço nasce desconectado: a fila por
+`enriched_at IS NULL`, a leitura dos anúncios pendentes e o wiring em
+`cmd/scraper` são a task de follow-up **compartilhada** — não duplique esse
+plumbing aqui. Quando ela existir, `MergePropertyData` roda **depois** de
+`GroupListing` (o merge precisa do vínculo já gravado).
 
 ## Gotchas
 - **Property órfã.** `createAndLink` faz `CreateProperty` e depois
@@ -77,6 +120,13 @@ anúncios pendentes e o wiring em `cmd/scraper` são a task de follow-up
 - **Falso positivo é caro de desfazer** (dois imóveis distintos viram um).
   O default 0,85 e os `slog.Debug` de prompt/resposta em `internal/ai` existem
   para calibrar; a correção é `db.UnlinkListingFromProperty` + `DeleteProperty`.
-- Os testes usam fakes: o comportamento real do SQL (`Find`/`Create`/`Link`)
-  contra um PostgreSQL de verdade fica para o QA, como já registrado em
-  `internal/db/CLAUDE.md`.
+- **Janela de *lost update* no merge, aceita de propósito.** `MergePropertyData`
+  faz `SELECT` + `UPDATE` sem `FOR UPDATE`: dois merges concorrentes do mesmo
+  imóvel podem sobrescrever um ao outro. É tolerável porque a operação é
+  idempotente e re-executável pela fila. Fechar a janela exigiria
+  `SELECT ... FOR UPDATE` + `UPDATE` **dentro de uma função de `db`** (padrão de
+  `LinkListingToProperty`) — não tente compor transações entre pacotes, o que
+  `createAndLink` deliberadamente não faz.
+- Os testes usam fakes: o comportamento real do SQL (`Find`/`Create`/`Link`/
+  `List`/`Update`) contra um PostgreSQL de verdade fica para o QA, como já
+  registrado em `internal/db/CLAUDE.md`.

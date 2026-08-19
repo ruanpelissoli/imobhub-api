@@ -77,8 +77,11 @@ type Listing struct {
 	PropertyID *string
 }
 
-// PropertyStore é o acesso a properties de que o agrupamento precisa. A
-// interface é declarada **aqui, no consumidor**: internal/db expõe funções
+// PropertyStore é o acesso a dados de que o pacote precisa: os três primeiros
+// métodos servem ao agrupamento (GroupListing) e os três últimos à consolidação
+// do canônico (MergePropertyData).
+//
+// A interface é declarada **aqui, no consumidor**: internal/db expõe funções
 // livres de propósito (ver internal/db/CLAUDE.md) e não ganha struct nem
 // interface de repositório. É isso que permite testar este fluxo sem
 // PostgreSQL e sem gastar token.
@@ -86,6 +89,14 @@ type PropertyStore interface {
 	FindPropertiesByCoordinates(ctx context.Context, lat, lng float64, radiusMeters int) ([]db.Property, error)
 	CreateProperty(ctx context.Context, property db.Property) (db.Property, error)
 	LinkListingToProperty(ctx context.Context, propertyID string, listingID int64) error
+
+	// GetPropertyByID devolve (nil, nil) quando o id não existe — mesmo
+	// contrato de db.GetPropertyByID.
+	GetPropertyByID(ctx context.Context, propertyID string) (*db.Property, error)
+	// ListListingsByPropertyID devolve os anúncios do imóvel **ordenados por
+	// id**; a ordem é o que sustenta a idempotência do merge.
+	ListListingsByPropertyID(ctx context.Context, propertyID string) ([]db.Listing, error)
+	UpdateProperty(ctx context.Context, property db.Property) error
 }
 
 // PropertyMatcher é a comparação por IA. Satisfeita por *ai.Client.
