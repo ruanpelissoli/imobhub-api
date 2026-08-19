@@ -51,9 +51,15 @@ ON CONFLICT (source_domain, listing_url) DO UPDATE SET
 // deleteStaleListingsSQL remove os anúncios de um domínio que não apareceram na
 // coleta atual. O corte é o instante em que o run começou: tudo que foi visto
 // desde então teve last_seen_at renovado pelo upsert.
+//
+// O RETURNING property_id é o que fecha o ciclo de vida do vínculo: sem ele o
+// hard delete deixaria properties.active_listing_count inflado para sempre, e o
+// imóvel canônico viraria órfão e indeletável (a guarda de DeleteProperty exige
+// contador zerado). NULL é o caso normal de um anúncio nunca agrupado.
 const deleteStaleListingsSQL = `
 DELETE FROM listings
-WHERE source_domain = $1 AND last_seen_at < $2`
+WHERE source_domain = $1 AND last_seen_at < $2
+RETURNING property_id`
 
 // countListingsSQL conta o catálogo inteiro. COUNT(*) exato (e não a estimativa
 // de pg_class.reltuples) porque o número vai para o resumo do run, que é o
@@ -113,7 +119,7 @@ func UpsertListings(ctx context.Context, pool *pgxpool.Pool, listings []RawListi
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	for chunk := range slices.Chunk(rows, upsertBatchSize) {
-		if err := execUpsertBatch(ctx, tx, chunk); err != nil {
+		if err := execBatch(ctx, tx, upsertListingSQL, chunk); err != nil {
 			return fmt.Errorf("db: upsert listings: %w", err)
 		}
 	}
@@ -126,7 +132,15 @@ func UpsertListings(ctx context.Context, pool *pgxpool.Pool, listings []RawListi
 }
 
 // DeleteStaleListings apaga os anúncios do domínio que não foram vistos na
-// coleta iniciada em runStartedAt, e devolve quantos foram removidos.
+// coleta iniciada em runStartedAt e fecha o ciclo de vida do vínculo com
+// properties: devolve quantos anúncios saíram e quantos imóveis canônicos
+// ficaram sem nenhum anúncio e foram removidos junto.
+//
+// **Tudo numa única transação**, e não como Execs soltos: o hard delete dos
+// anúncios sem o decremento correspondente deixaria active_listing_count
+// inflado para sempre, e o imóvel viraria órfão *e* indeletável — a guarda de
+// DeleteProperty exige contador zerado, e ele nunca mais chegaria a zero. Ou os
+// três passos entram, ou nenhum entra.
 //
 // Chame **apenas** quando a coleta do domínio tiver terminado com sucesso: uma
 // coleta interrompida no meio (site fora do ar, seletores quebrados) teria
@@ -135,23 +149,132 @@ func UpsertListings(ctx context.Context, pool *pgxpool.Pool, listings []RawListi
 //
 // runStartedAt precisa ser o instante lido antes do primeiro upsert do run.
 // Usar "agora" apagaria também os anúncios acabados de gravar.
-func DeleteStaleListings(ctx context.Context, pool *pgxpool.Pool, domain string, runStartedAt time.Time) (int64, error) {
+func DeleteStaleListings(ctx context.Context, pool *pgxpool.Pool, domain string, runStartedAt time.Time) (int64, int64, error) {
 	domain = strings.TrimSpace(domain)
 	if domain == "" {
-		return 0, errors.New("db: delete stale listings: domain is required")
+		return 0, 0, errors.New("db: delete stale listings: domain is required")
 	}
 	// Sem esta guarda o zero value não apagaria nada e o erro de programação
 	// (esquecer de carimbar o início do run) passaria despercebido.
 	if runStartedAt.IsZero() {
-		return 0, fmt.Errorf("db: delete stale listings for domain %q: runStartedAt is required", domain)
+		return 0, 0, fmt.Errorf("db: delete stale listings for domain %q: runStartedAt is required", domain)
 	}
 
-	tag, err := pool.Exec(ctx, deleteStaleListingsSQL, domain, runStartedAt)
+	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("db: delete stale listings for domain %q: %w", domain, err)
+		return 0, 0, fmt.Errorf("db: delete stale listings for domain %q: begin transaction: %w", domain, err)
+	}
+	// Rollback após um Commit bem-sucedido é no-op no pgx; o defer cobre todos
+	// os returns de erro abaixo sem duplicação.
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	deletedListings, propertyIDs, err := deleteStaleRows(ctx, tx, domain, runStartedAt)
+	if err != nil {
+		return 0, 0, fmt.Errorf("db: delete stale listings for domain %q: %w", domain, err)
 	}
 
-	return tag.RowsAffected(), nil
+	deltas := staleCountsByProperty(propertyIDs)
+	if len(deltas) == 0 {
+		// Nada foi apagado, ou tudo que saiu nunca tinha sido agrupado: nenhum
+		// contador a mexer e nenhuma property a avaliar.
+		if err := tx.Commit(ctx); err != nil {
+			return 0, 0, fmt.Errorf("db: delete stale listings for domain %q: commit: %w", domain, err)
+		}
+		return deletedListings, 0, nil
+	}
+
+	decrements := make([][]any, 0, len(deltas))
+	affected := make([]string, 0, len(deltas))
+	for _, delta := range deltas {
+		decrements = append(decrements, []any{delta.propertyID, delta.count})
+		affected = append(affected, delta.propertyID)
+	}
+
+	for chunk := range slices.Chunk(decrements, upsertBatchSize) {
+		if err := execBatch(ctx, tx, decrementListingCountBySQL, chunk); err != nil {
+			return 0, 0, fmt.Errorf("db: delete stale listings for domain %q: decrement listing counts: %w", domain, err)
+		}
+	}
+
+	tag, err := tx.Exec(ctx, deleteOrphanPropertiesSQL, affected)
+	if err != nil {
+		return 0, 0, fmt.Errorf("db: delete stale listings for domain %q: delete orphan properties: %w", domain, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, 0, fmt.Errorf("db: delete stale listings for domain %q: commit: %w", domain, err)
+	}
+
+	return deletedListings, tag.RowsAffected(), nil
+}
+
+// deleteStaleRows executa o DELETE e consome o RETURNING, devolvendo quantas
+// linhas saíram e o property_id de cada uma (nil para anúncio nunca agrupado),
+// **com multiplicidade** — é ela que diz de quanto cada imóvel precisa ser
+// decrementado.
+//
+// O pgx não permite outra query na mesma conexão enquanto as linhas não forem
+// consumidas, então o rows.Close() (via defer) acontece antes de qualquer
+// statement seguinte da transação.
+func deleteStaleRows(ctx context.Context, tx pgx.Tx, domain string, runStartedAt time.Time) (int64, []*string, error) {
+	rows, err := tx.Query(ctx, deleteStaleListingsSQL, domain, runStartedAt)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer rows.Close()
+
+	var deleted int64
+	propertyIDs := make([]*string, 0, 64)
+	for rows.Next() {
+		var propertyID *string
+		if err := rows.Scan(&propertyID); err != nil {
+			return 0, nil, fmt.Errorf("scan deleted property_id: %w", err)
+		}
+		deleted++
+		propertyIDs = append(propertyIDs, propertyID)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, nil, err
+	}
+
+	return deleted, propertyIDs, nil
+}
+
+// propertyDelta é quantos anúncios um imóvel canônico perdeu nesta limpeza.
+type propertyDelta struct {
+	propertyID string
+	count      int
+}
+
+// staleCountsByProperty agrega os property_id devolvidos pelo DELETE em um
+// delta por imóvel. Os nil (anúncios nunca agrupados) são ignorados: não há
+// contador a mexer.
+//
+// A saída é **ordenada por id**, e isso não é cosmético: dois runs concorrentes
+// que decrementassem o mesmo par de imóveis em ordens opostas se travariam
+// mutuamente. Ordem fixa é a ordem de aquisição de locks.
+func staleCountsByProperty(propertyIDs []*string) []propertyDelta {
+	counts := make(map[string]int, len(propertyIDs))
+	for _, propertyID := range propertyIDs {
+		if propertyID == nil {
+			continue
+		}
+		id := strings.TrimSpace(*propertyID)
+		if id == "" {
+			continue
+		}
+		counts[id]++
+	}
+
+	deltas := make([]propertyDelta, 0, len(counts))
+	for id, count := range counts {
+		deltas = append(deltas, propertyDelta{propertyID: id, count: count})
+	}
+	slices.SortFunc(deltas, func(a, b propertyDelta) int {
+		return strings.Compare(a.propertyID, b.propertyID)
+	})
+
+	return deltas
 }
 
 // CountListings devolve quantos anúncios existem hoje na tabela listings,
@@ -229,14 +352,14 @@ func scanListing(row pgx.Row) (Listing, error) {
 	return listing, nil
 }
 
-// execUpsertBatch envia um lote de upserts pelo pipeline do pgx e consome um
+// execBatch envia um lote do mesmo statement pelo pipeline do pgx e consome um
 // resultado por comando. Consumir todos os Exec antes do Close é o que faz um
 // erro de banco aparecer aqui (com o comando que falhou) em vez de virar um
 // erro genérico na transação.
-func execUpsertBatch(ctx context.Context, tx pgx.Tx, rows [][]any) error {
+func execBatch(ctx context.Context, tx pgx.Tx, sql string, rows [][]any) error {
 	batch := &pgx.Batch{}
 	for _, args := range rows {
-		batch.Queue(upsertListingSQL, args...)
+		batch.Queue(sql, args...)
 	}
 
 	results := tx.SendBatch(ctx, batch)

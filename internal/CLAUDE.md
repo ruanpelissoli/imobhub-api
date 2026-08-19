@@ -71,6 +71,10 @@ comodidades do `TermExtractor` chega por parâmetro de construtor (de
   `property` canônico (`PropertyGrouper.GroupListing`, com `ai.MatchProperty`) e
   **consolida o canônico** a partir de todos os anúncios vinculados
   (`PropertyGrouper.MergePropertyData`: fotos, descrição, comodidades e quartos).
+  `PropertyGrouper.HandleListingRemoval` é a operação inversa, **unitária**, para
+  desfazer um agrupamento errado — a limpeza de fim de coleta não passa por ela
+  (quem apaga os anúncios sumidos e as properties órfãs, na mesma transação, é
+  `db.DeleteStaleListings`).
   Segue o padrão de `selectors` — orquestra `ai` + `db` — e **não** vive em
   `enrichment` justamente porque aquele pacote não importa `db` nem `ai`. As
   interfaces de acesso a dados são declaradas nele (consumidor); `db` continua

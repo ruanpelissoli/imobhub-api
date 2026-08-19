@@ -77,9 +77,9 @@ type Listing struct {
 	PropertyID *string
 }
 
-// PropertyStore é o acesso a dados de que o pacote precisa: os três primeiros
-// métodos servem ao agrupamento (GroupListing) e os três últimos à consolidação
-// do canônico (MergePropertyData).
+// PropertyStore é o acesso a dados de que o pacote precisa, em três blocos: o
+// agrupamento (GroupListing), a consolidação do canônico (MergePropertyData) e
+// a remoção de um anúncio do grupo (HandleListingRemoval).
 //
 // A interface é declarada **aqui, no consumidor**: internal/db expõe funções
 // livres de propósito (ver internal/db/CLAUDE.md) e não ganha struct nem
@@ -97,6 +97,12 @@ type PropertyStore interface {
 	// id**; a ordem é o que sustenta a idempotência do merge.
 	ListListingsByPropertyID(ctx context.Context, propertyID string) ([]db.Listing, error)
 	UpdateProperty(ctx context.Context, property db.Property) error
+
+	// UnlinkListingFromProperty devolve o imóvel de que o anúncio saiu, ou
+	// string vazia quando não havia vínculo (inclusive anúncio inexistente).
+	UnlinkListingFromProperty(ctx context.Context, listingID int64) (string, error)
+	GetActiveListingCount(ctx context.Context, propertyID string) (int, error)
+	DeleteProperty(ctx context.Context, propertyID string) error
 }
 
 // PropertyMatcher é a comparação por IA. Satisfeita por *ai.Client.
@@ -229,6 +235,72 @@ func (g *PropertyGrouper) GroupListing(ctx context.Context, listing Listing) (st
 	}
 
 	return g.createAndLink(ctx, listing)
+}
+
+// HandleListingRemoval tira um anúncio do seu imóvel canônico e apaga o imóvel
+// se ele tiver ficado sem nenhum anúncio. Devolve se o imóvel foi apagado.
+//
+// É o caminho **unitário**, para desfazer uma deduplicação errada (dois imóveis
+// distintos que viraram um). A limpeza em lote do fim de cada coleta não passa
+// por aqui: quem apaga os anúncios sumidos do site é db.DeleteStaleListings, e
+// ela já decrementa o contador e remove os órfãos na mesma transação.
+//
+// Os três passos são transações **independentes** (cada função de db abre a
+// sua), mesmo precedente de createAndLink. Isso é seguro porque a guarda vive no
+// próprio DELETE: se um anúncio novo for vinculado entre a contagem e a
+// remoção, o imóvel simplesmente não é apagado e o resultado é um warning.
+//
+// Anúncio sem vínculo — nunca agrupado ou já inexistente — é no-op sem erro:
+// desvincular é limpeza, e falhar nela travaria o reprocessamento.
+func (g *PropertyGrouper) HandleListingRemoval(ctx context.Context, listingID int64) (bool, error) {
+	if listingID <= 0 {
+		return false, ErrMissingListingID
+	}
+
+	propertyID, err := g.store.UnlinkListingFromProperty(ctx, listingID)
+	if err != nil {
+		return false, fmt.Errorf("grouping: unlinking listing %d: %w", listingID, err)
+	}
+	if strings.TrimSpace(propertyID) == "" {
+		return false, nil
+	}
+
+	count, err := g.store.GetActiveListingCount(ctx, propertyID)
+	if errors.Is(err, db.ErrPropertyNotFound) {
+		slog.WarnContext(ctx, "property of the removed listing no longer exists",
+			"listing_id", listingID,
+			"property_id", propertyID,
+		)
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("grouping: counting listings of property %q: %w", propertyID, err)
+	}
+
+	if count > 0 {
+		return false, nil
+	}
+
+	err = g.store.DeleteProperty(ctx, propertyID)
+	switch {
+	case err == nil:
+		slog.InfoContext(ctx, "canonical property deleted after losing its last listing",
+			"listing_id", listingID,
+			"property_id", propertyID,
+		)
+		return true, nil
+	case errors.Is(err, db.ErrPropertyHasListings), errors.Is(err, db.ErrPropertyNotFound):
+		// Outro anúncio foi vinculado entre a contagem e o DELETE, ou o imóvel
+		// já tinha sido apagado. Nos dois casos o estado final é o correto.
+		slog.WarnContext(ctx, "canonical property was not deleted after the listing removal",
+			"listing_id", listingID,
+			"property_id", propertyID,
+			"error", err,
+		)
+		return false, nil
+	default:
+		return false, fmt.Errorf("grouping: deleting property %q of listing %d: %w", propertyID, listingID, err)
+	}
 }
 
 // createAndLink cria o imóvel canônico a partir do anúncio e o vincula.

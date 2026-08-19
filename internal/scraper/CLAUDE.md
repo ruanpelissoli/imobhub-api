@@ -81,9 +81,15 @@ re-extração) → `SyncListings` → log `[domínio] ✓ N listings (...)`.
   do módulo, não uma otimização: uma coleta devolve zero anúncios quando o site
   mudou de layout, respondeu com página de erro em HTTP 200 ou o JS não
   renderizou. Em nenhum desses casos o catálogo sumiu de verdade, e prosseguir
-  apagaria todo o histórico do domínio por causa de uma falha silenciosa. O
+  apagaria todo o histórico do domínio por causa de uma falha silenciosa. Desde
+  que `DeleteStaleListings` também remove imóveis canônicos órfãos, essa guarda
+  protege **os dois** níveis: sem anúncios, nenhuma `property` é apagada. O
   caminho correto para zero anúncios é `selectors.RecoverSelectors`, não o
   DELETE.
+- **`SyncStats.PropertiesDeleted` vem de `db.DeleteStaleListings`**, que apaga os
+  imóveis canônicos que ficaram sem nenhum anúncio na mesma transação do DELETE.
+  Não é uma contagem por domínio: um `property` pode agrupar anúncios de várias
+  fontes e só some quando o último cai.
 - **Ordem fixa: upsert e só então DELETE.** O upsert renova o `last_seen_at` de
   tudo que foi visto agora; inverter apagaria anúncios vivos na janela entre as
   duas operações. Se o upsert falha, o DELETE **não** roda — parte dos anúncios
@@ -101,8 +107,14 @@ re-extração) → `SyncListings` → log `[domínio] ✓ N listings (...)`.
   testar a guarda de zero anúncios e a ordem das operações sem PostgreSQL. Não
   exporte: em produção o wiring é sempre o default.
 - O log `[domínio] sync concluído: %d upserted, %d deletados` é contratual
-  (critério de aceitação) e tem teste. O caso ignorado loga em **Warn**, não
-  Info: contagem parada no dia seguinte se explica por essa linha.
+  (critério de aceitação) e tem teste — **não acrescente campos a ele**. O caso
+  ignorado loga em **Warn**, não Info: contagem parada no dia seguinte se
+  explica por essa linha.
+- **A remoção de imóveis órfãos sai numa linha separada e condicional**
+  (`[domínio] %d imóveis canônicos removidos por terem ficado sem anúncios`,
+  Info, só com `PropertiesDeleted > 0`). Separada para não mexer no log
+  contratual; condicional porque a remoção é rara e uma linha "0 removidos" em
+  todo domínio de todo run só polui.
 
 ## Key decisions
 - **Seletores compilados uma vez com `cascadia`, não `Find(string)` por card.**

@@ -46,6 +46,20 @@ type fakeStore struct {
 	updatedProperty db.Property
 	lastGetID       string
 	lastListID      string
+
+	// Caminho unitário de remoção (HandleListingRemoval).
+	unlinkedPropertyID string
+	unlinkErr          error
+	activeCount        int
+	countErr           error
+	deleteErr          error
+
+	unlinkCalls       int
+	countCalls        int
+	deleteCalls       int
+	unlinkedID        int64
+	countedID         string
+	deletedPropertyID string
 }
 
 func (s *fakeStore) FindPropertiesByCoordinates(_ context.Context, lat, lng float64, radiusMeters int) ([]db.Property, error) {
@@ -102,6 +116,30 @@ func (s *fakeStore) UpdateProperty(_ context.Context, property db.Property) erro
 	s.updateCalls++
 	s.updatedProperty = property
 	return s.updateErr
+}
+
+func (s *fakeStore) UnlinkListingFromProperty(_ context.Context, listingID int64) (string, error) {
+	s.unlinkCalls++
+	s.unlinkedID = listingID
+	if s.unlinkErr != nil {
+		return "", s.unlinkErr
+	}
+	return s.unlinkedPropertyID, nil
+}
+
+func (s *fakeStore) GetActiveListingCount(_ context.Context, propertyID string) (int, error) {
+	s.countCalls++
+	s.countedID = propertyID
+	if s.countErr != nil {
+		return 0, s.countErr
+	}
+	return s.activeCount, nil
+}
+
+func (s *fakeStore) DeleteProperty(_ context.Context, propertyID string) error {
+	s.deleteCalls++
+	s.deletedPropertyID = propertyID
+	return s.deleteErr
 }
 
 // fakeMatcher substitui a chamada paga à Anthropic.
@@ -570,6 +608,150 @@ func TestPropertyFromCopiesCoordinatePointers(t *testing.T) {
 	}
 	if property.BedroomCount == listing.BedroomCount {
 		t.Error("the property aliases the caller's bedroom count pointer")
+	}
+}
+
+// O imóvel ainda tem outros anúncios: nada é apagado, e os anúncios restantes
+// não são tocados.
+func TestHandleListingRemovalKeepsPropertyWithRemainingListings(t *testing.T) {
+	store := &fakeStore{unlinkedPropertyID: "prop-a", activeCount: 2}
+	grouper := newTestGrouper(t, store, &fakeMatcher{})
+
+	deleted, err := grouper.HandleListingRemoval(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("HandleListingRemoval() error = %v, want nil", err)
+	}
+	if deleted {
+		t.Error("deleted = true, want false: o imóvel ainda tem anúncios")
+	}
+	if store.unlinkCalls != 1 || store.unlinkedID != 42 {
+		t.Errorf("unlink calls = %d (listing %d), want 1 com o listing 42", store.unlinkCalls, store.unlinkedID)
+	}
+	if store.countedID != "prop-a" {
+		t.Errorf("contagem pedida para %q, want prop-a", store.countedID)
+	}
+	if store.deleteCalls != 0 {
+		t.Errorf("deleteCalls = %d, want 0", store.deleteCalls)
+	}
+}
+
+// Última listing ativa: o imóvel canônico é apagado.
+func TestHandleListingRemovalDeletesPropertyWithoutListings(t *testing.T) {
+	store := &fakeStore{unlinkedPropertyID: "prop-a", activeCount: 0}
+	grouper := newTestGrouper(t, store, &fakeMatcher{})
+
+	deleted, err := grouper.HandleListingRemoval(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("HandleListingRemoval() error = %v, want nil", err)
+	}
+	if !deleted {
+		t.Error("deleted = false, want true")
+	}
+	if store.deleteCalls != 1 || store.deletedPropertyID != "prop-a" {
+		t.Errorf("delete = %d chamadas (%q), want 1 em prop-a", store.deleteCalls, store.deletedPropertyID)
+	}
+}
+
+// Anúncio nunca agrupado (ou inexistente): no-op, sem contar e sem apagar nada.
+func TestHandleListingRemovalIsNoOpForUnlinkedListing(t *testing.T) {
+	for _, unlinked := range []string{"", "   "} {
+		store := &fakeStore{unlinkedPropertyID: unlinked}
+		grouper := newTestGrouper(t, store, &fakeMatcher{})
+
+		deleted, err := grouper.HandleListingRemoval(context.Background(), 42)
+		if err != nil {
+			t.Fatalf("HandleListingRemoval() error = %v, want nil", err)
+		}
+		if deleted {
+			t.Error("deleted = true, want false")
+		}
+		if store.countCalls != 0 || store.deleteCalls != 0 {
+			t.Errorf("banco foi tocado além do unlink: count=%d delete=%d", store.countCalls, store.deleteCalls)
+		}
+	}
+}
+
+func TestHandleListingRemovalRequiresListingID(t *testing.T) {
+	store := &fakeStore{}
+	grouper := newTestGrouper(t, store, &fakeMatcher{})
+
+	for _, listingID := range []int64{0, -1} {
+		if _, err := grouper.HandleListingRemoval(context.Background(), listingID); !errors.Is(err, ErrMissingListingID) {
+			t.Fatalf("HandleListingRemoval(%d) error = %v, want ErrMissingListingID", listingID, err)
+		}
+	}
+	if store.unlinkCalls != 0 {
+		t.Errorf("unlinkCalls = %d, want 0", store.unlinkCalls)
+	}
+}
+
+// O imóvel já não existe: o estado final é o desejado, então não é erro.
+func TestHandleListingRemovalToleratesMissingProperty(t *testing.T) {
+	store := &fakeStore{unlinkedPropertyID: "prop-a", countErr: db.ErrPropertyNotFound}
+	grouper := newTestGrouper(t, store, &fakeMatcher{})
+
+	deleted, err := grouper.HandleListingRemoval(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("HandleListingRemoval() error = %v, want nil", err)
+	}
+	if deleted {
+		t.Error("deleted = true, want false")
+	}
+	if store.deleteCalls != 0 {
+		t.Errorf("deleteCalls = %d, want 0", store.deleteCalls)
+	}
+}
+
+// Um anúncio vinculado entre a contagem e o DELETE faz a guarda do próprio
+// statement barrar a remoção — é benigno, não erro.
+func TestHandleListingRemovalToleratesPropertyRelinkedInBetween(t *testing.T) {
+	store := &fakeStore{unlinkedPropertyID: "prop-a", activeCount: 0, deleteErr: db.ErrPropertyHasListings}
+	grouper := newTestGrouper(t, store, &fakeMatcher{})
+
+	deleted, err := grouper.HandleListingRemoval(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("HandleListingRemoval() error = %v, want nil", err)
+	}
+	if deleted {
+		t.Error("deleted = true, want false")
+	}
+}
+
+func TestHandleListingRemovalPropagatesUnexpectedErrors(t *testing.T) {
+	unlinkErr := errors.New("db: connection refused")
+	countErr := errors.New("db: connection reset")
+	deleteErr := errors.New("db: deadlock detected")
+
+	tests := []struct {
+		name    string
+		store   *fakeStore
+		wantErr error
+	}{
+		{name: "falha no unlink", store: &fakeStore{unlinkErr: unlinkErr}, wantErr: unlinkErr},
+		{
+			name:    "falha na contagem",
+			store:   &fakeStore{unlinkedPropertyID: "prop-a", countErr: countErr},
+			wantErr: countErr,
+		},
+		{
+			name:    "falha no delete",
+			store:   &fakeStore{unlinkedPropertyID: "prop-a", deleteErr: deleteErr},
+			wantErr: deleteErr,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			grouper := newTestGrouper(t, tt.store, &fakeMatcher{})
+
+			deleted, err := grouper.HandleListingRemoval(context.Background(), 42)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want it to wrap %v", err, tt.wantErr)
+			}
+			if deleted {
+				t.Error("deleted = true, want false")
+			}
+		})
 	}
 }
 

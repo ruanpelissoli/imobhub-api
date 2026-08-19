@@ -50,3 +50,15 @@ func (s *poolStore) ListListingsByPropertyID(ctx context.Context, propertyID str
 func (s *poolStore) UpdateProperty(ctx context.Context, property db.Property) error {
 	return db.UpdateProperty(ctx, s.pool, property)
 }
+
+func (s *poolStore) UnlinkListingFromProperty(ctx context.Context, listingID int64) (string, error) {
+	return db.UnlinkListingFromProperty(ctx, s.pool, listingID)
+}
+
+func (s *poolStore) GetActiveListingCount(ctx context.Context, propertyID string) (int, error) {
+	return db.GetActiveListingCount(ctx, s.pool, propertyID)
+}
+
+func (s *poolStore) DeleteProperty(ctx context.Context, propertyID string) error {
+	return db.DeleteProperty(ctx, s.pool, propertyID)
+}
