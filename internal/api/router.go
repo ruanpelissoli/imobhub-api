@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/imobhub/api/internal/db"
@@ -36,17 +37,20 @@ func (d Deps) logger() *slog.Logger {
 
 // NewRouter monta o roteador com a cadeia de middlewares.
 //
-// A ordem é de fora para dentro: recovery → requestID → logging → cors →
-// jsonErrors → mux. recovery é o mais externo para que um panic em qualquer
-// outro middleware ainda vire 500; requestID vem dentro dele (para que o panic
-// continue virando 500) e fora do logging (para que toda linha de log já tenha o
-// id); logging registra o status que o recovery escreveu; cors precisa responder
-// o preflight sem passar pelo mux (que devolveria 404 na rota inexistente do
-// preflight); jsonErrors é o mais interno porque só existe para reescrever o que
-// o próprio mux emite.
+// A ordem é de fora para dentro: metrics → recovery → requestID → logging →
+// cors → jsonErrors → mux. metrics é o mais externo para observar o status
+// final, inclusive o 500 que o recovery escreve depois de um panic — por dentro
+// dele, a taxa de erro subestimaria falhas reais; recovery vem em seguida para
+// que um panic em qualquer outro middleware ainda vire 500; requestID vem dentro
+// dele (para que o panic continue virando 500) e fora do logging (para que toda
+// linha de log já tenha o id); logging registra o status que o recovery
+// escreveu; cors precisa responder o preflight sem passar pelo mux (que
+// devolveria 404 na rota inexistente do preflight); jsonErrors é o mais interno
+// porque só existe para reescrever o que o próprio mux emite.
 func NewRouter(deps Deps) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
+	mux.Handle("GET "+metricsPath, promhttp.Handler())
 	registerV1Routes(mux, deps)
 
 	logger := deps.logger()
@@ -57,6 +61,7 @@ func NewRouter(deps Deps) http.Handler {
 	handler = logging(handler, logger)
 	handler = requestID(handler)
 	handler = recovery(handler, logger)
+	handler = metrics(handler, mux)
 
 	return handler
 }
