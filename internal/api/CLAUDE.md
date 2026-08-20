@@ -2,7 +2,7 @@
 
 ## Purpose
 Monta o servidor HTTP: roteador (`/api/v1` + `/health`), os middlewares base
-(recovery, logging, CORS, envelope JSON de erro), o ciclo de vida do
+(recovery, request id, logging, CORS, envelope JSON de erro), o ciclo de vida do
 `http.Server` (timeouts + shutdown gracioso) e os handlers de negócio — hoje
 `GET /api/v1/properties` (busca paginada com cache Redis). `cmd/api` só
 orquestra o boot.
@@ -15,16 +15,43 @@ orquestra o boot.
   quando a stdlib resolve. Se algum dia faltar algo (sub-routers com middleware
   por grupo, por exemplo), a troca é local a este pacote — mas aí `chi` passa a
   ser o roteador **de todo o projeto**, não de um handler só.
-- **Ordem da cadeia, de fora para dentro: `recovery → logging → cors →
-  jsonErrors → mux`.** Cada posição é deliberada:
+- **Ordem da cadeia, de fora para dentro: `recovery → requestID → logging →
+  cors → jsonErrors → mux`.** Cada posição é deliberada:
   - `recovery` é o mais externo para que um panic em qualquer outro middleware
     ainda vire 500 em vez de derrubar a conexão;
-  - `logging` vem logo abaixo para registrar o status que o `recovery` escreveu
-    (um 500 de panic aparece na linha de log como 500);
+  - `requestID` fica **entre** os dois: dentro do `recovery` (para que um panic
+    nele continue virando 500) e fora do `logging` (para que toda linha de log
+    já nasça com o id). É middleware próprio, e não parte do `logging`, porque
+    produzir identidade é **gerar estado**; o `logging` continua só observando;
+  - `logging` vem abaixo para registrar o status que o `recovery` escreveu;
   - `cors` precisa responder o preflight **antes** do mux — `OPTIONS /api/v1/x`
     numa rota inexistente viraria 404 se descesse;
   - `jsonErrors` é o mais interno porque só existe para reescrever o que o
     próprio mux emite.
+- **`request_id` é herdado-e-validado ou gerado.** O `X-Request-Id` da
+  requisição só é aceito com **≤64 chars em `[A-Za-z0-9_-]`**; qualquer outra
+  coisa (vazio, longo demais, espaço, `/`, `\n`) é descartada **em silêncio** e
+  substituída por um UUID v4 de `crypto/rand` — sem dependência externa no
+  `go.mod`. Nem 400 nem log de erro: é input não confiável que termina num
+  header de resposta e numa linha de log, e responder erro só daria ao cliente
+  um canal barato de flood. O valor é escrito no header de resposta **antes** do
+  handler downstream, para existir mesmo se ele entrar em panic, e propagado por
+  `context.Context` com chave de tipo não-exportado (`ctxKeyRequestID`), lida por
+  `requestIDFromContext` (devolve `""` quando ausente).
+- **`remote_addr` é o `r.RemoteAddr` cru.** Não interpretamos `X-Forwarded-For`
+  nem `X-Real-IP`: confiar neles sem um proxy confiável configurado é spoofing de
+  graça — o cliente escolhe o IP que vai para o log. Tratar proxy é outra task.
+- **`quietPaths` rebaixa `/health` (e `/metrics`, quando existir) para `Debug`.**
+  O handler de `cmd/api` nasce em `Info`, então o liveness do orquestrador
+  simplesmente some do log de produção sem precisar de um `LOG_LEVEL` — que
+  arrastaria `internal/config`, que este pacote não importa. `/metrics` já está
+  no conjunto mesmo sem a rota existir, para não exigir edição quando nascer. O
+  casamento é por path **exato**: prefixo pegaria um `/healthz` de terceiros por
+  acidente.
+- **O `request_id` do log de panic vem do header, não do contexto.** O `recovery`
+  é externo ao `requestID`, então o `r` capturado pelo `defer` dele é o de fora —
+  sem o valor no contexto. A fonte é `w.Header().Get(headerRequestID)`, que o
+  `requestID` já setou.
 - **`wrapWriter` é idempotente.** `recovery` cria o `*responseWriter` e `logging`
   reaproveita o mesmo. Duas camadas de wrapper contariam bytes duas vezes e
   esconderiam o status real.
@@ -103,8 +130,10 @@ orquestra o boot.
   Redis lento consumiria o `WriteTimeout` de 30s do servidor e o cache passaria a
   piorar exatamente a latência que existe para melhorar.
 - **`X-Cache: HIT|MISS` em toda resposta 200**, e o `cors` emite
-  `Access-Control-Expose-Headers: X-Cache` para origens permitidas — sem isso o
-  browser esconde o header e o front não consegue nem medir o hit rate.
+  `Access-Control-Expose-Headers: X-Cache, X-Request-Id` para origens permitidas
+  — sem isso o browser esconde os dois headers: o front não consegue nem medir o
+  hit rate, nem citar o `request_id` num relato de erro, que é a razão de
+  devolvê-lo. Header novo que o front precise ler entra em `corsExposeHeaders`.
 - **Seams declarados no consumidor** (`propertySearcher`, `cacheStore`), mesmo
   padrão de `grouping.PropertyStore`: o wiring de produção fecha sobre
   `deps.Pool`/`deps.Redis` em `registerV1Routes` e os testes injetam closures e um
@@ -177,6 +206,17 @@ por `cmd/api`.
   path aninhado, o redirect); `Deps.Pool` é `*pgxpool.Pool` concreto, sem
   interface para fakear, então `200`/`404`/`500` reais ficam para o QA. O
   mapeamento do DTO é coberto pela função pura.
+- **Um panic não produz linha do `logging`, só a do `recovery`.** O `logging`
+  loga **depois** do `next.ServeHTTP` e não usa `defer`, então o unwinding passa
+  através dele sem emitir nada — a requisição gera apenas o `Error` do
+  `recovery`, que por isso carrega `method`, `path` e `request_id` próprios. Não
+  procure o 500 de panic nas linhas `api: request`.
+- **Teste que espera linha `Debug` precisa de handler com
+  `Level: slog.LevelDebug`.** `capturingHandler` embute o `slog.Handler` e
+  delega o `Enabled` a ele: com `slog.NewJSONHandler(io.Discard, nil)` (default
+  `Info`) um registro `Debug` é descartado **antes** de chegar ao `Handle`, e o
+  teste veria zero linhas em vez de falhar por nível errado. Use o helper
+  `newCapture(slog.LevelDebug)`.
 - **Não escreva no `ResponseWriter` antes de decidir o status.** Se o handler já
   começou a responder, o `recovery` não consegue trocar a resposta por 500 —
   ele mantém o que foi enviado (trocar produziria uma resposta corrompida).
