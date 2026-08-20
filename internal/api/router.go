@@ -36,12 +36,14 @@ func (d Deps) logger() *slog.Logger {
 
 // NewRouter monta o roteador com a cadeia de middlewares.
 //
-// A ordem é de fora para dentro: recovery → logging → cors → jsonErrors → mux.
-// recovery é o mais externo para que um panic em qualquer outro middleware ainda
-// vire 500; logging vem logo abaixo para registrar o status que o recovery
-// escreveu; cors precisa responder o preflight sem passar pelo mux (que
-// devolveria 404 na rota inexistente do preflight); jsonErrors é o mais interno
-// porque só existe para reescrever o que o próprio mux emite.
+// A ordem é de fora para dentro: recovery → requestID → logging → cors →
+// jsonErrors → mux. recovery é o mais externo para que um panic em qualquer
+// outro middleware ainda vire 500; requestID vem dentro dele (para que o panic
+// continue virando 500) e fora do logging (para que toda linha de log já tenha o
+// id); logging registra o status que o recovery escreveu; cors precisa responder
+// o preflight sem passar pelo mux (que devolveria 404 na rota inexistente do
+// preflight); jsonErrors é o mais interno porque só existe para reescrever o que
+// o próprio mux emite.
 func NewRouter(deps Deps) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
@@ -53,6 +55,7 @@ func NewRouter(deps Deps) http.Handler {
 	handler = jsonErrors(handler)
 	handler = cors(handler, deps.CORSOrigins)
 	handler = logging(handler, logger)
+	handler = requestID(handler)
 	handler = recovery(handler, logger)
 
 	return handler

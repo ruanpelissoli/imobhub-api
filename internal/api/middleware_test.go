@@ -26,6 +26,25 @@ func (h *capturingHandler) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 
+// newCapture monta a captura com um nível explícito porque capturingHandler
+// delega Enabled ao handler embutido: com o default (Info) um registro Debug é
+// descartado antes de chegar ao Handle e o teste veria zero linhas.
+func newCapture(level slog.Leveler) (*capturingHandler, *slog.Logger) {
+	capture := &capturingHandler{
+		Handler: slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: level}),
+	}
+	return capture, slog.New(capture)
+}
+
+func attrsOf(r slog.Record) map[string]slog.Value {
+	attrs := map[string]slog.Value{}
+	r.Attrs(func(a slog.Attr) bool {
+		attrs[a.Key] = a.Value
+		return true
+	})
+	return attrs
+}
+
 func TestRecoveryTurnsPanicIntoJSONAndKeepsServing(t *testing.T) {
 	var calls int
 	handler := recovery(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -110,6 +129,195 @@ func TestLoggingEmitsOneLinePerRequest(t *testing.T) {
 	}
 	if got := attrs["bytes"].Int64(); got <= 0 {
 		t.Errorf("bytes = %d, want > 0", got)
+	}
+}
+
+func TestLoggingIncludesRequestIDAndRemoteAddr(t *testing.T) {
+	capture, logger := newCapture(slog.LevelDebug)
+
+	handler := requestID(logging(okHandler(), logger))
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/v1/exemplo", nil))
+
+	if len(capture.records) != 1 {
+		t.Fatalf("linhas de log = %d, want 1", len(capture.records))
+	}
+
+	attrs := attrsOf(capture.records[0])
+	for _, key := range []string{"request_id", "method", "path", "status", "duration_ms", "bytes", "remote_addr"} {
+		if _, ok := attrs[key]; !ok {
+			t.Errorf("campo %q ausente na linha de log", key)
+		}
+	}
+	if got := attrs["remote_addr"].String(); got != "192.0.2.1:1234" {
+		t.Errorf("remote_addr = %q, want o RemoteAddr da requisição", got)
+	}
+	if got := attrs["request_id"].String(); got == "" {
+		t.Error("request_id vazio na linha de log")
+	}
+}
+
+func TestRequestIDPropagatesClientHeader(t *testing.T) {
+	const sent = "abc-123_XYZ"
+
+	capture, logger := newCapture(slog.LevelDebug)
+
+	var fromContext string
+	handler := requestID(logging(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fromContext = requestIDFromContext(r.Context())
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}), logger))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/exemplo", nil)
+	req.Header.Set(headerRequestID, sent)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get(headerRequestID); got != sent {
+		t.Errorf("%s da resposta = %q, want %q", headerRequestID, got, sent)
+	}
+	if fromContext != sent {
+		t.Errorf("request_id no contexto = %q, want %q", fromContext, sent)
+	}
+	if len(capture.records) != 1 {
+		t.Fatalf("linhas de log = %d, want 1", len(capture.records))
+	}
+	if got := attrsOf(capture.records[0])["request_id"].String(); got != sent {
+		t.Errorf("request_id na linha de log = %q, want %q", got, sent)
+	}
+}
+
+func TestRequestIDIsGeneratedWhenAbsent(t *testing.T) {
+	capture, logger := newCapture(slog.LevelDebug)
+
+	var fromContext string
+	handler := requestID(logging(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fromContext = requestIDFromContext(r.Context())
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}), logger))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/exemplo", nil))
+
+	fromHeader := rec.Header().Get(headerRequestID)
+	if fromHeader == "" {
+		t.Fatalf("%s da resposta vazio, want um id gerado", headerRequestID)
+	}
+	if !validRequestID(fromHeader) {
+		t.Errorf("id gerado %q não passa na própria validação", fromHeader)
+	}
+	if fromContext != fromHeader {
+		t.Errorf("request_id no contexto = %q, want %q", fromContext, fromHeader)
+	}
+	if len(capture.records) != 1 {
+		t.Fatalf("linhas de log = %d, want 1", len(capture.records))
+	}
+	if got := attrsOf(capture.records[0])["request_id"].String(); got != fromHeader {
+		t.Errorf("request_id na linha de log = %q, want %q", got, fromHeader)
+	}
+}
+
+func TestRequestIDRejectsInvalidClientHeader(t *testing.T) {
+	tests := []struct {
+		name string
+		sent string
+	}{
+		{name: "longo demais", sent: strings.Repeat("a", requestIDMaxLen+1)},
+		{name: "caractere fora da lista", sent: "abc/def"},
+		{name: "com espaço", sent: "abc def"},
+		{name: "com quebra de linha", sent: "abc\ndef"},
+		{name: "vazio", sent: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := requestID(okHandler())
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/exemplo", nil)
+			req.Header[headerRequestID] = []string{tt.sent}
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			got := rec.Header().Get(headerRequestID)
+			if got == "" {
+				t.Fatalf("%s da resposta vazio, want um id gerado", headerRequestID)
+			}
+			if got == tt.sent {
+				t.Errorf("%s = %q, want um id gerado no lugar do valor inválido", headerRequestID, got)
+			}
+			if !validRequestID(got) {
+				t.Errorf("id gerado %q não passa na própria validação", got)
+			}
+			if rec.Code != http.StatusOK {
+				t.Errorf("status = %d, want %d (valor inválido é descartado em silêncio)", rec.Code, http.StatusOK)
+			}
+		})
+	}
+}
+
+func TestQuietPathsLogAtDebugLevel(t *testing.T) {
+	tests := []struct {
+		name      string
+		path      string
+		wantLevel slog.Level
+	}{
+		{name: "liveness é ruído de infraestrutura", path: "/health", wantLevel: slog.LevelDebug},
+		{name: "rota de negócio", path: "/api/v1/inexistente", wantLevel: slog.LevelInfo},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			capture, logger := newCapture(slog.LevelDebug)
+			router := NewRouter(Deps{Logger: logger})
+
+			router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, tt.path, nil))
+
+			if len(capture.records) != 1 {
+				t.Fatalf("linhas de log = %d, want 1", len(capture.records))
+			}
+			if got := capture.records[0].Level; got != tt.wantLevel {
+				t.Errorf("nível = %v, want %v", got, tt.wantLevel)
+			}
+			if got := attrsOf(capture.records[0])["request_id"].String(); got == "" {
+				t.Error("request_id vazio na linha de log emitida pelo roteador")
+			}
+		})
+	}
+}
+
+func TestRecoveryLogIncludesRequestID(t *testing.T) {
+	capture, logger := newCapture(slog.LevelDebug)
+
+	handler := recovery(requestID(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic("boom")
+	})), logger)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/exemplo", nil))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+	if got := decodeError(t, rec.Body.Bytes()); got != msgInternalError {
+		t.Errorf("error = %q, want %q", got, msgInternalError)
+	}
+
+	fromHeader := rec.Header().Get(headerRequestID)
+	if fromHeader == "" {
+		t.Fatalf("%s da resposta vazio mesmo com panic", headerRequestID)
+	}
+	if len(capture.records) != 1 {
+		t.Fatalf("linhas de log = %d, want 1", len(capture.records))
+	}
+	if got := attrsOf(capture.records[0])["request_id"].String(); got != fromHeader {
+		t.Errorf("request_id do log de panic = %q, want %q", got, fromHeader)
+	}
+}
+
+func TestRequestIDIsExposedByCORS(t *testing.T) {
+	if !strings.Contains(corsExposeHeaders, headerRequestID) {
+		t.Errorf("corsExposeHeaders = %q, want conter %q", corsExposeHeaders, headerRequestID)
 	}
 }
 
