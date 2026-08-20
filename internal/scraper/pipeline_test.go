@@ -29,6 +29,9 @@ type stubDeps struct {
 	syncs     []syncArgs
 	brokens   []string
 	countCall int
+
+	// lastRun é o Redis fake ligado a Deps.PublishLastRun.
+	lastRun *fakeLastRunStore
 }
 
 type syncArgs struct {
@@ -51,7 +54,7 @@ func stubSelectors(domain string) *db.SelectorConfig {
 // newStub devolve dependências que fazem a coleta de urls terminar em sucesso,
 // com listingsPerSite anúncios por fonte.
 func newStub(urls []string, listingsPerSite int) *stubDeps {
-	s := &stubDeps{}
+	s := &stubDeps{lastRun: &fakeLastRunStore{}}
 
 	s.Deps = Deps{
 		SourcesFile: "sources.txt",
@@ -97,6 +100,7 @@ func newStub(urls []string, listingsPerSite int) *stubDeps {
 			s.countCall++
 			return 42, nil
 		},
+		PublishLastRun: (&lastRunPublisher{store: s.lastRun}).publish,
 	}
 
 	return s
@@ -166,6 +170,65 @@ func requireLogged(t *testing.T, buf *bytes.Buffer, want string) {
 	t.Fatalf("log %q não encontrado; logs:\n%s", want, strings.Join(messages, "\n"))
 }
 
+// logRecords devolve cada linha logada como mapa, para os testes que verificam
+// atributos além do `msg`.
+func logRecords(t *testing.T, buf *bytes.Buffer) []map[string]any {
+	t.Helper()
+
+	var records []map[string]any
+	scanner := bufio.NewScanner(bytes.NewReader(buf.Bytes()))
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatalf("decoding log line %q: %v", line, err)
+		}
+		records = append(records, record)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("reading captured logs: %v", err)
+	}
+
+	return records
+}
+
+// requireLoggedEvent casa a linha pelo `msg` contratual e verifica o `event`
+// que ela precisa carregar, devolvendo o registro para asserções de atributo.
+func requireLoggedEvent(t *testing.T, buf *bytes.Buffer, msg, event string) map[string]any {
+	t.Helper()
+
+	for _, record := range logRecords(t, buf) {
+		if record["msg"] != msg {
+			continue
+		}
+		if record["event"] != event {
+			t.Fatalf("log %q com event = %v, want %q", msg, record["event"], event)
+		}
+		return record
+	}
+
+	t.Fatalf("log %q não encontrado; logs:\n%s", msg, strings.Join(logMessages(t, buf), "\n"))
+	return nil
+}
+
+func requireAttrs(t *testing.T, record map[string]any, msg string, want map[string]any) {
+	t.Helper()
+
+	for key, value := range want {
+		got, ok := record[key]
+		if !ok {
+			t.Errorf("log %q sem o atributo %q", msg, key)
+			continue
+		}
+		if got != value {
+			t.Errorf("log %q: %s = %v, want %v", msg, key, got, value)
+		}
+	}
+}
+
 func requireNotLogged(t *testing.T, buf *bytes.Buffer, unwanted string) {
 	t.Helper()
 
@@ -185,7 +248,7 @@ func TestRunProcessesEverySourceInOrder(t *testing.T) {
 		t.Fatalf("Run() error = %v, want nil", err)
 	}
 
-	want := RunSummary{Sites: 2, Succeeded: 2, Listings: 6, TotalInDB: 42}
+	want := RunSummary{Sites: 2, Succeeded: 2, Listings: 6, Removed: 4, TotalInDB: 42}
 	if summary != want {
 		t.Errorf("Run() = %+v, want %+v", summary, want)
 	}
@@ -352,7 +415,7 @@ func TestRunKeepsGoingWhenOneSourceFails(t *testing.T) {
 		t.Fatalf("Run() error = %v, want nil", err)
 	}
 
-	want := RunSummary{Sites: 2, Succeeded: 1, Failed: 1, Listings: 2, TotalInDB: 42}
+	want := RunSummary{Sites: 2, Succeeded: 1, Failed: 1, Listings: 2, Removed: 2, TotalInDB: 42}
 	if summary != want {
 		t.Errorf("Run() = %+v, want %+v", summary, want)
 	}
@@ -497,6 +560,244 @@ func TestRunStillLogsSummaryWhenCountFails(t *testing.T) {
 	requireLogged(t, buf, "coleta concluída: 1 fontes (1 com sucesso, 0 com erro, 0 bloqueadas), 1 anúncios coletados, 0 anúncios no banco")
 }
 
+func TestRunLogsTheEventVocabulary(t *testing.T) {
+	buf := captureLogs(t)
+	stub := newStub([]string{"https://bloqueado.com.br/imoveis", "https://ok.com.br/imoveis"}, 3)
+	stub.IsAllowed = func(_ context.Context, rawURL string) (bool, error) {
+		return !strings.Contains(rawURL, "bloqueado"), nil
+	}
+
+	if _, err := stub.run(t, context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	requireLoggedEvent(t, buf, "pipeline iniciado: 2 fontes carregadas", eventRunStarted)
+	requireLoggedEvent(t, buf, "[bloqueado.com.br] bloqueado por robots.txt", eventSiteBlocked)
+
+	// O texto das mensagens é contratual; o event e os campos agregáveis são a
+	// camada nova, e é ela que os operadores filtram.
+	scraped := requireLoggedEvent(t, buf, "[ok.com.br] ✓ 3 listings (upserted: 3, deletados: 2)", eventSiteScraped)
+	requireAttrs(t, scraped, "site_scraped", map[string]any{
+		"domain":           "ok.com.br",
+		"listings_found":   float64(3),
+		"listings_removed": float64(2),
+	})
+	if _, ok := scraped["duration_ms"]; !ok {
+		t.Error("a linha de fonte coletada precisa carregar duration_ms")
+	}
+
+	finished := requireLoggedEvent(t,
+		buf,
+		"coleta concluída: 2 fontes (1 com sucesso, 0 com erro, 1 bloqueadas), 3 anúncios coletados, 42 anúncios no banco",
+		eventRunFinished)
+	requireAttrs(t, finished, "scraper_run_finished", map[string]any{
+		"sites_total":          float64(2),
+		"sites_succeeded":      float64(1),
+		"sites_failed":         float64(0),
+		"sites_blocked":        float64(1),
+		"listings_found":       float64(3),
+		"listings_removed":     float64(2),
+		"listings_total_in_db": float64(42),
+	})
+	if _, ok := finished["duration_ms"]; !ok {
+		t.Error("o resumo final precisa carregar duration_ms")
+	}
+}
+
+func TestRunLogsSiteFailureWithTheScrapedEvent(t *testing.T) {
+	buf := captureLogs(t)
+	stub := newStub([]string{"https://quebrado.com.br/imoveis"}, 1)
+	stub.EnsureSelectors = func(_ context.Context, domain, _ string) (*db.SelectorConfig, error) {
+		return nil, errors.New("anthropic: 429 rate limited")
+	}
+
+	if _, err := stub.run(t, context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	record := requireLoggedEvent(t, buf, "[quebrado.com.br] falha ao obter os seletores", eventSiteScraped)
+	if record["error"] == nil {
+		t.Error("a falha de uma fonte precisa carregar o atributo error")
+	}
+	requireAttrs(t, record, "site_scraped", map[string]any{
+		"domain":         "quebrado.com.br",
+		"listings_found": float64(0),
+	})
+}
+
+func TestRunPublishesTheLastRunSummary(t *testing.T) {
+	stub := newStub([]string{"https://a.com.br/imoveis", "https://b.com.br/imoveis"}, 3)
+
+	before := time.Now().UTC().Truncate(time.Second)
+	if _, err := stub.run(t, context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	if stub.lastRun.sets != 1 {
+		t.Fatalf("gravações em %s = %d, want 1", LastRunCacheKey, stub.lastRun.sets)
+	}
+	if stub.lastRun.lastKey != LastRunCacheKey {
+		t.Errorf("chave = %q, want %q", stub.lastRun.lastKey, LastRunCacheKey)
+	}
+	if stub.lastRun.lastTTL != 48*time.Hour {
+		t.Errorf("TTL = %v, want 48h", stub.lastRun.lastTTL)
+	}
+
+	run := stub.lastRun.decode(t)
+	want := LastRun{
+		RanAt:             run.RanAt,
+		Success:           true,
+		SitesTotal:        2,
+		SitesSucceeded:    2,
+		SitesBlocked:      0,
+		SitesFailed:       0,
+		ListingsFound:     6,
+		ListingsRemoved:   4,
+		ListingsTotalInDB: 42,
+		DurationMS:        run.DurationMS,
+	}
+	if run != want {
+		t.Errorf("resumo publicado = %+v, want %+v", run, want)
+	}
+	if run.DurationMS < 0 {
+		t.Errorf("duration_ms = %d, want >= 0", run.DurationMS)
+	}
+
+	ranAt, err := time.Parse(time.RFC3339, run.RanAt)
+	if err != nil {
+		t.Fatalf("ran_at = %q, want RFC3339: %v", run.RanAt, err)
+	}
+	if ranAt.Before(before) {
+		t.Errorf("ran_at = %v, want o instante de início do run (>= %v)", ranAt, before)
+	}
+}
+
+func TestRunPublishesFailureWhenASourceFails(t *testing.T) {
+	stub := newStub([]string{"https://quebrado.com.br/imoveis", "https://ok.com.br/imoveis"}, 2)
+	stub.EnsureSelectors = func(_ context.Context, domain, _ string) (*db.SelectorConfig, error) {
+		if domain == "quebrado.com.br" {
+			return nil, errors.New("anthropic: 429 rate limited")
+		}
+		return stubSelectors(domain), nil
+	}
+
+	if _, err := stub.run(t, context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	run := stub.lastRun.decode(t)
+	if run.Success {
+		t.Error("success = true com uma fonte falha, want false")
+	}
+	if run.SitesFailed != 1 || run.SitesSucceeded != 1 {
+		t.Errorf("resumo = %+v, want 1 falha e 1 sucesso", run)
+	}
+}
+
+func TestRunPublishesSuccessWhenASourceIsBlockedByRobots(t *testing.T) {
+	// Bloqueio por robots.txt é o pipeline funcionando: não pode marcar o run
+	// como malsucedido.
+	stub := newStub([]string{"https://bloqueado.com.br/imoveis", "https://ok.com.br/imoveis"}, 2)
+	stub.IsAllowed = func(_ context.Context, rawURL string) (bool, error) {
+		return !strings.Contains(rawURL, "bloqueado"), nil
+	}
+
+	if _, err := stub.run(t, context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	run := stub.lastRun.decode(t)
+	if !run.Success {
+		t.Error("success = false com fonte bloqueada por robots.txt, want true")
+	}
+	if run.SitesBlocked != 1 || run.SitesFailed != 0 {
+		t.Errorf("resumo = %+v, want 1 bloqueada e 0 falhas", run)
+	}
+}
+
+func TestRunPublishesPartialSummaryWhenInterrupted(t *testing.T) {
+	stub := newStub([]string{"https://a.com.br/imoveis", "https://b.com.br/imoveis"}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	stub.Sync = func(_ context.Context, domain string, listings []db.RawListing, runStartedAt time.Time) (SyncStats, error) {
+		stub.syncs = append(stub.syncs, syncArgs{domain: domain, listings: listings, runStartedAt: runStartedAt})
+		cancel()
+		return SyncStats{Upserted: int64(len(listings)), Deleted: 1}, nil
+	}
+	t.Cleanup(cancel)
+
+	if _, err := stub.run(t, ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled", err)
+	}
+
+	if stub.lastRun.sets != 1 {
+		t.Fatalf("gravações = %d, want 1 — o run interrompido é o que o operador precisa ver", stub.lastRun.sets)
+	}
+	// Sem o context.WithoutCancel a gravação falharia justamente aqui.
+	if stub.lastRun.ctxErrDuringSet != nil {
+		t.Errorf("ctx.Err() dentro do Set = %v, want nil", stub.lastRun.ctxErrDuringSet)
+	}
+
+	run := stub.lastRun.decode(t)
+	if run.Success {
+		t.Error("success = true num run abortado, want false")
+	}
+	if run.SitesSucceeded != 1 || run.ListingsFound != 1 || run.ListingsRemoved != 1 {
+		t.Errorf("resumo = %+v, want os números parciais da primeira fonte", run)
+	}
+}
+
+func TestRunPublishesFailureWhenSourcesCannotBeRead(t *testing.T) {
+	stub := newStub(nil, 0)
+	stub.ReadSources = func(string) ([]string, error) { return nil, errors.New("permission denied") }
+
+	if _, err := stub.run(t, context.Background()); err == nil {
+		t.Fatal("Run() error = nil, want erro fatal")
+	}
+
+	if stub.lastRun.sets != 1 {
+		t.Fatalf("gravações = %d, want 1", stub.lastRun.sets)
+	}
+	if run := stub.lastRun.decode(t); run.Success {
+		t.Errorf("success = true com o arquivo de fontes ilegível: %+v", run)
+	}
+}
+
+func TestRunIgnoresLastRunPublishFailures(t *testing.T) {
+	buf := captureLogs(t)
+	stub := newStub([]string{"https://a.com.br/imoveis"}, 3)
+	stub.lastRun.setErr = errors.New("dial tcp: connection refused")
+
+	summary, err := stub.run(t, context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil — falha de Redis não pode mudar o resultado do run", err)
+	}
+
+	want := RunSummary{Sites: 1, Succeeded: 1, Listings: 3, Removed: 2, TotalInDB: 42}
+	if summary != want {
+		t.Errorf("Run() = %+v, want %+v", summary, want)
+	}
+
+	requireLoggedEvent(t, buf, "não foi possível publicar o resumo da última coleta no Redis", eventLastRunPublishFailed)
+}
+
+func TestRunWithoutLastRunPublisherStillCollects(t *testing.T) {
+	// Client de Redis nulo é caminho válido "sem persistência": o run acontece
+	// igual, sem panic e sem escrita.
+	stub := newStub([]string{"https://a.com.br/imoveis"}, 2)
+	stub.PublishLastRun = nil
+
+	summary, err := stub.run(t, context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if summary.Succeeded != 1 || summary.Listings != 2 {
+		t.Errorf("Run() = %+v, want a fonte coletada", summary)
+	}
+	if stub.lastRun.sets != 0 {
+		t.Errorf("gravações = %d, want 0 sem seam configurado", stub.lastRun.sets)
+	}
+}
+
 func TestNewRejectsIncompleteWiring(t *testing.T) {
 	// Um campo nulo em Deps só apareceria como panic no meio da primeira coleta;
 	// a validação transforma isso em falha de boot.
@@ -519,6 +820,8 @@ func TestNewRejectsIncompleteWiring(t *testing.T) {
 		{"sem sincronizador", func(d *Deps) { d.Sync = nil }},
 		{"sem contagem", func(d *Deps) { d.CountListings = nil }},
 	}
+	// PublishLastRun fica fora da lista de propósito: é o único campo opcional
+	// de Deps, e sem ele o pipeline roda — só não publica o resumo.
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -537,7 +840,7 @@ func TestNewRejectsIncompleteWiring(t *testing.T) {
 }
 
 func TestRunPipelineRejectsMissingConfigOrPool(t *testing.T) {
-	if err := RunPipeline(context.Background(), nil, nil); !errors.Is(err, ErrMissingConfig) {
+	if err := RunPipeline(context.Background(), nil, nil, nil); !errors.Is(err, ErrMissingConfig) {
 		t.Errorf("RunPipeline(nil cfg) error = %v, want %v", err, ErrMissingConfig)
 	}
 }

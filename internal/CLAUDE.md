@@ -29,7 +29,7 @@ cmd/scraper → config, db, cache, scraper, enrichqueue
 cmd/api     → config, db, cache, api
 api         → pgxpool, go-redis, prometheus/client_golang, stdlib   (NÃO importa config)
 cache       → go-redis    (folha, como config e db)
-scraper     → config, db, ratelimit, robots, selectors, sources, pgxpool
+scraper     → config, db, ratelimit, robots, selectors, sources, pgxpool, go-redis
 enrichqueue → ai, config, db, enrichment, grouping, pgxpool
 selectors   → ai, db, httpclient
 grouping    → ai, db, pgxpool
@@ -65,9 +65,12 @@ middleware que é a camada mais externa da cadeia.
 `config` e `cache` são folhas do grafo — não importam nada do projeto. `cache`
 recebe a `REDIS_URL` por parâmetro (de `cfg.RedisURL`, em `main`) justamente
 para continuar assim, e entrega **só** o `*redis.Client` validado por `Ping`:
-set/get, TTL e desenho de chaves ficam em quem consumir o cache. O primeiro
-consumidor é `api`, na busca de imóveis — chave, TTL e política de fallback
-estão documentados em `internal/api/CLAUDE.md`, não aqui.
+set/get, TTL e desenho de chaves ficam em quem consumir o cache. São dois os
+consumidores: `api`, na busca de imóveis (`properties:search:v1:`, documentada
+em `internal/api/CLAUDE.md`), e `scraper`, no resumo da última coleta
+(`scraper:last_run`, em `internal/scraper/CLAUDE.md`). Nenhum dos dois importa
+`internal/cache` — os dois recebem o `*redis.Client` já pronto do `main`, que é
+o que mantém `cache` folha e o desenho das chaves junto de quem as lê.
 
 `enrichment` **era** folha e deixou de ser com o geocoder: ele fala com o
 Nominatim e reusa `ratelimit.DomainLimiter` (espaçamento fixo por host, sem

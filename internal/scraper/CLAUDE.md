@@ -40,6 +40,65 @@ re-extração) → `SyncListings` → log `[domínio] ✓ N listings (...)`.
 - Os logs `[domínio] ✓ %d listings (upserted: %d, deletados: %d)` e
   `[domínio] bloqueado por robots.txt` são contratuais e têm teste.
 
+## Logs: o atributo `event` (`pipeline.go`)
+Os textos de `msg` são humanos, contratuais e testados — **não os reescreva**.
+Quem filtra e agrega usa o atributo `event`, que é a chave estável:
+
+| `event` | quando | nível | campos próprios |
+|---|---|---|---|
+| `scraper_run_started` | início do run | Info | `sites_total`, `sources_file` |
+| `scraper_run_no_sources` | arquivo sem fontes utilizáveis | Warn | `sources_file` |
+| `scraper_run_aborted` | cancelamento entre fontes | Warn | `processed`, `sites_total`, `error` |
+| `site_blocked` | robots.txt proibiu | Warn | `domain`, `site_url`, `duration_ms` |
+| `site_scraped` | desfecho **terminal** de uma fonte | Info/Error | `domain`, `site_url`, `listings_found`, `listings_removed`, `duration_ms`, `error` (só em falha) |
+| `site_selectors_recovering` | zero anúncios, redescoberta acionada | Warn | `domain`, `render_mode` |
+| `site_selectors_mark_broken_failed` | `MarkBroken` falhou | Warn | `domain`, `error` |
+| `scraper_summary_count_failed` | `CountListings` falhou | Warn | `error` |
+| `scraper_run_finished` | fim do run | Info | `sites_total`, `sites_succeeded`, `sites_failed`, `sites_blocked`, `listings_found`, `listings_removed`, `listings_total_in_db`, `duration_ms` |
+| `scraper_last_run_publish_failed` | gravação no Redis falhou | Warn | `key`, `error` |
+| `scraper_last_run_persistence_disabled` | pipeline sem seam de Redis | Debug | — |
+
+- **Invariante: cada fonte produz exatamente uma linha `site_scraped`** (ou uma
+  `site_blocked`, que não é falha). É o que permite contar fontes por agregação
+  em vez de por texto. Os quatro pontos terminais de `processSite` passam pelo
+  helper `logSiteScraped`, e é por isso que ele existe: campos divergentes entre
+  os caminhos de sucesso e de falha quebrariam a contagem em silêncio.
+- `duration_ms` da fonte é medido em volta do processamento **daquela** fonte
+  (carimbo na entrada de `processSite`); o do run, em volta de `Run` inteiro.
+
+## Resumo da última coleta no Redis (`last_run.go`)
+Ao fim de **todo** run montado, o pipeline publica um JSON em
+`scraper.LastRunCacheKey` (`scraper:last_run`) com TTL de **48h**:
+
+```json
+{"ran_at":"2026-08-19T03:00:00Z","success":true,"sites_total":3,
+ "sites_succeeded":2,"sites_failed":0,"sites_blocked":1,"listings_found":120,
+ "listings_removed":7,"listings_total_in_db":4200,"duration_ms":91000}
+```
+
+- **`success = Failed == 0 && err == nil`.** Fonte bloqueada por robots.txt
+  **não** derruba o `success` — é o pipeline obedecendo, não falhando. Run
+  abortado (SIGTERM, arquivo de fontes ilegível) é `success=false`.
+- **A gravação é feita por `defer` em `Run`**, não no caminho feliz: um run
+  morto no meio é justamente o que o operador precisa enxergar, com os números
+  parciais. Só não é publicado quando o pipeline nem chegou a ser montado (erro
+  de wiring/config), e `-only=enrich` não passa por aqui.
+- **`ran_at` é o instante de *início* do run**, em RFC3339 UTC. Com
+  `duration_ms` o fim é derivável, e o início é o carimbo estável mesmo quando
+  o processo é morto no meio.
+- **A gravação usa `context.WithoutCancel` + timeout próprio de 3s.** Derivar do
+  `ctx` do run faria a escrita falhar sempre no caminho de SIGTERM — o cenário em
+  que ela mais importa. O timeout curto impede que um Redis lento segure o
+  encerramento.
+- **Falha de Redis é `Warn` e nada mais**: não muda `RunSummary`, o erro
+  devolvido por `Run` nem o exit code.
+- **A constante da chave é exportada** para que o futuro leitor na API a reuse.
+  Ela mora aqui e não em `internal/cache`, que é folha do grafo e não desenha
+  chaves — mesma regra que `internal/api` segue com `properties:search:v1:`.
+- **`TotalInDB` fica zerado nos caminhos de abort**, porque `logSummary` (que faz
+  a contagem) não roda neles. É esperado: `listings_total_in_db: 0` num payload
+  com `success=false` significa "não deu tempo de contar".
+
 ## Key decisions (`pipeline.go`)
 - **Fontes sequenciais.** O rate limit é por domínio (fontes não competem entre
   si), então paralelizar só ganharia em sites lentos — contra N Chromes headless
@@ -53,7 +112,16 @@ re-extração) → `SyncListings` → log `[domínio] ✓ N listings (...)`.
   teste: um closure por campo, sem mock, sem rede, sem PostgreSQL e sem gastar
   tokens da Anthropic. `New` rejeita campo nulo, que viraria panic na 1ª coleta.
 - **`Run` devolve `RunSummary`; `RunPipeline` descarta** — o binário só precisa do
-  exit code, mas os números são o que os testes verificam.
+  exit code, mas os números são o que os testes verificam. `RunSummary` é
+  comparada com `==` nos testes: **não acrescente campo não determinístico a
+  ela** (a duração do run é medida em `Run` e passada adiante, nunca guardada
+  na struct).
+- **`PublishLastRun` é o único campo opcional de `Deps`** e o único seam de
+  Redis do pacote (`lastRunStore`, declarado no consumidor como `api.cacheStore`).
+  `NewPipeline` só o preenche quando recebe um client não-nulo — a checagem mora
+  em `newLastRunPublisher`, **antes** da atribuição à interface, porque um
+  `*redis.Client` nil guardado numa interface produz interface **não-nil** e
+  panic na primeira gravação.
 - **Falha na contagem do resumo (`db.CountListings`) não derruba o run**: o
   número é informativo, e perder o resumo inteiro por causa dele seria pior.
 
@@ -174,4 +242,7 @@ compilar os seletores e detectar CSS inválido), `internal/db`
 `MarkSelectorsBroken`, `CountListings`) e `pgxpool`. Desde `pipeline.go` também
 `internal/config`, `internal/sources`, `internal/robots`, `internal/ratelimit` e
 `internal/selectors` (de onde vêm os adaptadores `StaticFetcher`/`HeadlessFetcher`
-sobre `httpclient`). Consumido por `cmd/scraper`, que só chama `RunPipeline`.
+sobre `httpclient`). Desde `last_run.go`, `go-redis` — o client chega pronto por
+parâmetro de `NewPipeline`/`RunPipeline`, vindo de `cache.New` em `cmd/scraper`;
+este pacote **não** importa `internal/cache`. Consumido por `cmd/scraper`, que só
+chama `RunPipeline`.

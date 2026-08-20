@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/imobhub/api/internal/cache"
 	"github.com/imobhub/api/internal/config"
@@ -85,8 +86,8 @@ func run(only string) error {
 
 	// O Redis é validado no boot, como o banco: um cache inalcançável
 	// descoberto no meio da coleta é mais caro de diagnosticar do que uma falha
-	// de inicialização. Ainda não há consumidor do client — a decisão de falhar
-	// (em vez de degradar sem cache) está registrada em cmd/scraper/CLAUDE.md.
+	// de inicialização. A decisão de falhar (em vez de degradar sem cache) está
+	// registrada em cmd/scraper/CLAUDE.md.
 	redisClient, err := cache.New(ctx, cfg.RedisURL)
 	if err != nil {
 		return err
@@ -101,7 +102,7 @@ func run(only string) error {
 		"enrichment_workers", cfg.EnrichmentWorkers,
 	)
 
-	return runStage(ctx, stage, cfg, pool)
+	return runStage(ctx, stage, cfg, pool, redisClient)
 }
 
 // runStage despacha a etapa escolhida. É dispatch de CLI, não regra de negócio:
@@ -111,12 +112,12 @@ func run(only string) error {
 // Em stageAll a ordem é fixa: coleta e, **só em caso de sucesso**, o
 // enriquecimento. Enriquecer sobre uma coleta interrompida no meio processaria
 // um catálogo que ainda vai mudar no mesmo dia, gastando IA duas vezes.
-func runStage(ctx context.Context, stage string, cfg *config.Config, pool *pgxpool.Pool) error {
+func runStage(ctx context.Context, stage string, cfg *config.Config, pool *pgxpool.Pool, redisClient *redis.Client) error {
 	if stage == stageEnrich {
 		return enrichqueue.RunEnrichment(ctx, cfg, pool)
 	}
 
-	if err := scraper.RunPipeline(ctx, cfg, pool); err != nil {
+	if err := scraper.RunPipeline(ctx, cfg, pool, redisClient); err != nil {
 		return err
 	}
 	if stage == stageScrape {
