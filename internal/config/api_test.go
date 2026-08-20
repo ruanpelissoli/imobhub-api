@@ -30,6 +30,55 @@ func TestLoadAPIAppliesDefaults(t *testing.T) {
 	if cfg.CORSOrigins != nil {
 		t.Errorf("CORSOrigins = %v, want nil (CORS desligado)", cfg.CORSOrigins)
 	}
+	if cfg.RateLimitRPM != DefaultRateLimitRPM {
+		t.Errorf("RateLimitRPM = %d, want %d", cfg.RateLimitRPM, DefaultRateLimitRPM)
+	}
+}
+
+func TestLoadAPIReadsRateLimitRPM(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want int
+	}{
+		{name: "valor com espaços", raw: "  120  ", want: 120},
+		{name: "zero desliga o limiter", raw: "0", want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setAPIRequired(t)
+			t.Setenv(envRateLimitRPM, tt.raw)
+
+			cfg, err := LoadAPI()
+			if err != nil {
+				t.Fatalf("LoadAPI() error = %v, want nil", err)
+			}
+			if cfg.RateLimitRPM != tt.want {
+				t.Errorf("RateLimitRPM = %d, want %d", cfg.RateLimitRPM, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadAPIRejectsInvalidRateLimitRPM(t *testing.T) {
+	for _, raw := range []string{"-1", "abc", "60.5"} {
+		t.Run(raw, func(t *testing.T) {
+			setAPIRequired(t)
+			t.Setenv(envRateLimitRPM, raw)
+
+			_, err := LoadAPI()
+			if err == nil {
+				t.Fatalf("LoadAPI() com %s=%q deveria falhar", envRateLimitRPM, raw)
+			}
+			if !strings.Contains(err.Error(), raw) {
+				t.Errorf("mensagem %q não cita o valor recebido %q", err, raw)
+			}
+			if !strings.Contains(err.Error(), envRateLimitRPM) {
+				t.Errorf("mensagem %q não cita %s", err, envRateLimitRPM)
+			}
+		})
+	}
 }
 
 // A API não pode exigir as variáveis exclusivas do scraper — subir o servidor

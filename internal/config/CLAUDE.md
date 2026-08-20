@@ -12,8 +12,15 @@ ambiente diretamente.
 - **Obrigatórias de `Load()` (scraper):** `DATABASE_URL`, `REDIS_URL`,
   `ANTHROPIC_API_KEY`. Sem elas o processo não sobe.
 - **Obrigatórias de `LoadAPI()`:** apenas `DATABASE_URL` e `REDIS_URL`.
-  Opcionais: `PORT` (default `8080`) e `CORS_ORIGINS` (sem default — vazia
-  desliga o CORS).
+  Opcionais: `PORT` (default `8080`), `CORS_ORIGINS` (sem default — vazia
+  desliga o CORS) e `RATE_LIMIT_RPM` (default `60`).
+- **`RATE_LIMIT_RPM` é o teto de requisições por minuto por IP** aplicado pelo
+  middleware inbound de `internal/api`. `0` **desliga** o limitador (é a forma
+  documentada de desativá-lo em testes locais); negativo ou não numérico é erro
+  de boot citando o valor recebido. A regra vive em `parseNonNegativeInt`, que
+  existe em vez de reusar `parseRateLimitMS` só porque a mensagem daquele cita
+  "milliseconds" — enganosa para um limite contado em requisições. Note o
+  contraste com `parsePositiveInt`, que **rejeita** zero.
 - **`LoadAPI()` existe em vez de afrouxar `Load()`.** Tornar
   `ANTHROPIC_API_KEY` opcional em `Load()` resolveria o boot da API ao custo de
   o scraper subir sem chave e quebrar só na primeira chamada de IA, no meio de

@@ -28,8 +28,11 @@ const (
 	// corsExposeHeaders libera os headers de resposta que o browser esconde por
 	// padrão. Sem X-Cache aqui, o front não consegue nem medir o hit rate; sem
 	// X-Request-Id, não consegue citar o id da requisição num relato de erro —
-	// que é a razão de devolvê-lo.
-	corsExposeHeaders = headerCacheStatus + ", " + headerRequestID
+	// que é a razão de devolvê-lo; e sem os três do rate limiting o front não
+	// enxerga quanto ainda pode gastar nem quando pode tentar de novo depois de
+	// um 429.
+	corsExposeHeaders = headerCacheStatus + ", " + headerRequestID + ", " +
+		headerRetryAfter + ", " + headerRateLimitLimit + ", " + headerRateLimitRemaining
 
 	requestIDMaxLen = 64
 )
