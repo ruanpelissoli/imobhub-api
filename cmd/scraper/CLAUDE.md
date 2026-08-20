@@ -55,12 +55,20 @@ Nenhuma regra de negócio mora aqui — ela vive em `internal/`.
   — o contrato de `Connect` é fechar o pool sozinho em caso de erro. A mesma
   regra vale para `defer redisClient.Close()` e `cache.New`: os dois contratos
   são idênticos de propósito.
-- **Falha no Redis é erro de boot (exit 1), mesmo sem consumidor do cache.**
-  Hoje o client é criado e fechado sem uso; a alternativa — subir sem cache e
+- **Falha no Redis é erro de boot (exit 1).** A alternativa — subir sem cache e
   logar um warning — é mudança de comportamento e precisa de decisão explícita,
   não de um remendo aqui. Consequência prática: `REDIS_URL` é obrigatória e
   `docker compose up -d db redis` passa a ser pré-requisito de qualquer
   `go run ./cmd/scraper`.
+- **O client do Redis é repassado ao pipeline** (`runStage` →
+  `scraper.RunPipeline`), que publica o resumo da última coleta em
+  `scraper.LastRunCacheKey` (`scraper:last_run`, TTL de 48h). O repasse é só
+  wiring: chave, TTL, formato do payload e a regra de `success` moram em
+  `internal/scraper/CLAUDE.md`. Falha de gravação é `Warn` e **não** muda o exit
+  code — o resumo é observabilidade, não resultado.
+- **`-only=enrich` não escreve em `scraper:last_run`.** Não houve coleta, e um
+  resumo zerado sobrescreveria o da coleta real. Isso sai de graça da estrutura
+  do dispatch: aquele caminho nem chama `RunPipeline`.
 
 - **Em `-only=all`, o enriquecimento só roda se a coleta tiver dado certo.**
   Enriquecer sobre uma coleta interrompida no meio processaria um catálogo que
@@ -71,8 +79,9 @@ Nenhuma regra de negócio mora aqui — ela vive em `internal/`.
   erro em falha fatal (config, banco, arquivo de fontes ilegível, SIGTERM); uma
   fonte que falhou vira log de erro e uma linha no resumo, sem mudar o exit code
   — foi decisão de projeto para que um portal fora do ar não marque o run
-  inteiro como falho. Quem monitora deve ler o resumo (`failed`, `succeeded`),
-  não só o código de saída. O mesmo vale para o enriquecimento: um anúncio que
+  inteiro como falho. Quem monitora deve ler o resumo (`sites_failed`,
+  `sites_succeeded`) — no log `event=scraper_run_finished` ou na chave
+  `scraper:last_run` do Redis —, não só o código de saída. O mesmo vale para o enriquecimento: um anúncio que
   falha vira log e uma linha no resumo, e volta à fila no run seguinte.
 - **Exit code 1 depois de uma coleta bem-sucedida não significa dado perdido.**
   Se o enriquecimento falhar em `-only=all`, a coleta já foi persistida — o log

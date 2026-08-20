@@ -49,8 +49,12 @@ pacotes que consumirem o client.
 - **Um client por processo.** O scraper é batch (uma execução = uma coleta e
   sai) e o `*redis.Client` já é seguro para uso concorrente e tem pool próprio —
   não crie um por worker.
-- **Ainda não há consumidor do cache.** O client é criado e fechado sem ser
-  usado; mesmo assim, falha de Redis é erro de boot (exit 1). Se um dia a
+- **Os consumidores do client são `internal/api`** (busca de imóveis,
+  `properties:search:v1:`) **e `internal/scraper`** (resumo da última coleta,
+  `scraper:last_run`, TTL de 48h). Nenhum dos dois importa este pacote: os dois
+  recebem o `*redis.Client` já validado, do `main`. Chave, TTL e política de
+  fallback são documentados **neles**, não aqui.
+- **Falha de Redis é erro de boot (exit 1)** nos dois binários. Se um dia a
   preferência for degradar e subir sem cache, isso é mudança de comportamento e
   precisa de decisão explícita, não de um `if err != nil { log.Warn }` aqui.
 - **Fora de escopo hoje:** TLS/`rediss://`, Sentinel/Cluster, tuning de pool e
