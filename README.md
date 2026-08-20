@@ -105,6 +105,7 @@ exit 1, nunca fallback silencioso.
 
 ```bash
 curl -i localhost:8080/health          # 200 {"status":"ok"}
+curl -i localhost:8080/metrics         # 200 métricas no formato texto do Prometheus
 curl -i localhost:8080/api/v1/nada     # 404 {"error":"not found"}
 curl -i -X POST localhost:8080/health  # 405 {"error":"method not allowed"}
 
@@ -117,6 +118,31 @@ O `/health` é **liveness**: responde 200 sem tocar em Postgres ou Redis, para
 que uma oscilação do banco não faça o orquestrador reiniciar uma API viva. As
 rotas de negócio ficam sob `/api/v1`; SIGINT/SIGTERM disparam shutdown gracioso
 (as requisições em voo terminam antes de o processo sair).
+
+### `GET /metrics`
+
+Métricas da API no formato texto do Prometheus (`text/plain; version=0.0.4`),
+prontas para qualquer stack de monitoramento (Grafana, Datadog, etc.):
+
+- `http_requests_total{method, route, status_code}` — requisições finalizadas;
+- `http_request_duration_seconds{method, route}` — histograma de latência;
+- `http_requests_in_flight` — requisições simultâneas correntes;
+- métricas do runtime Go (goroutines, GC, heap).
+
+O label `route` é o **pattern** da rota (`/api/v1/properties/{id}`), nunca o path
+com o id real — o que evita uma série de métrica por imóvel. Requisição sem rota
+casada (404, preflight) usa o valor fixo `unmatched`. O próprio `/metrics` não é
+instrumentado.
+
+```bash
+curl -s localhost:8080/health >/dev/null
+curl -s localhost:8080/metrics | grep http_requests_total
+```
+
+> **Exposição:** o endpoint **não tem autenticação** — é decisão de escopo, não
+> esquecimento. Em produção ele deve ficar atrás de firewall, em rede interna ou
+> por trás de um proxy autenticado: latência por rota e taxa de erro descrevem a
+> topologia da API para quem quiser atacá-la.
 
 Uma execução aplica as migrations pendentes e roda duas etapas em sequência:
 

@@ -15,9 +15,13 @@ orquestra o boot.
   quando a stdlib resolve. Se algum dia faltar algo (sub-routers com middleware
   por grupo, por exemplo), a troca é local a este pacote — mas aí `chi` passa a
   ser o roteador **de todo o projeto**, não de um handler só.
-- **Ordem da cadeia, de fora para dentro: `recovery → requestID → logging →
-  cors → jsonErrors → mux`.** Cada posição é deliberada:
-  - `recovery` é o mais externo para que um panic em qualquer outro middleware
+- **Ordem da cadeia, de fora para dentro: `metrics → recovery → requestID →
+  logging → cors → jsonErrors → mux`.** Cada posição é deliberada:
+  - `metrics` é o mais externo para observar o **status final**, inclusive o 500
+    que o `recovery` escreve depois de um panic. Por dentro do `recovery`, o
+    unwinding passaria por ele antes da contabilização e a taxa de erro
+    subestimaria as falhas reais;
+  - `recovery` vem em seguida para que um panic em qualquer outro middleware
     ainda vire 500 em vez de derrubar a conexão;
   - `requestID` fica **entre** os dois: dentro do `recovery` (para que um panic
     nele continue virando 500) e fora do `logging` (para que toda linha de log
@@ -41,11 +45,10 @@ orquestra o boot.
 - **`remote_addr` é o `r.RemoteAddr` cru.** Não interpretamos `X-Forwarded-For`
   nem `X-Real-IP`: confiar neles sem um proxy confiável configurado é spoofing de
   graça — o cliente escolhe o IP que vai para o log. Tratar proxy é outra task.
-- **`quietPaths` rebaixa `/health` (e `/metrics`, quando existir) para `Debug`.**
-  O handler de `cmd/api` nasce em `Info`, então o liveness do orquestrador
-  simplesmente some do log de produção sem precisar de um `LOG_LEVEL` — que
-  arrastaria `internal/config`, que este pacote não importa. `/metrics` já está
-  no conjunto mesmo sem a rota existir, para não exigir edição quando nascer. O
+- **`quietPaths` rebaixa `/health` e `/metrics` para `Debug`.** O handler de
+  `cmd/api` nasce em `Info`, então o liveness do orquestrador e o scrape do
+  Prometheus simplesmente somem do log de produção sem precisar de um
+  `LOG_LEVEL` — que arrastaria `internal/config`, que este pacote não importa. O
   casamento é por path **exato**: prefixo pegaria um `/healthz` de terceiros por
   acidente.
 - **O `request_id` do log de panic vem do header, não do contexto.** O `recovery`
@@ -69,6 +72,12 @@ orquestra o boot.
   uma API perfeitamente viva. Fica **fora** do `/api/v1` porque é infraestrutura,
   não contrato de produto, e não deve ser versionada com ele. Readiness com
   checagem de dependências é outra coisa e ainda não existe.
+- **`prometheus/client_golang` é a primeira (e única) dependência externa deste
+  pacote** — exceção **consciente** à mesma regra que barra o `chi`. A stdlib não
+  emite formato de exposição do Prometheus nem mantém histogramas, e reimplementar
+  o formato texto + o `GoCollector` seria muito mais código do que o roteador que
+  a regra economiza. `/metrics` fica **fora** do `/api/v1`, como `/health`, e não
+  entra em `registerV1Routes`.
 - **Timeouts explícitos.** O zero-value do `http.Server` é "sem limite": uma
   conexão que manda headers byte a byte seguraria um goroutine indefinidamente.
   Valores: `ReadHeaderTimeout 5s` (defesa contra slowloris), `ReadTimeout 15s`,
@@ -139,6 +148,37 @@ orquestra o boot.
   `deps.Pool`/`deps.Redis` em `registerV1Routes` e os testes injetam closures e um
   fake, sem Postgres nem Redis.
 
+## `GET /metrics` — observabilidade (`metrics.go`)
+- **O label `route` vem de `mux.Handler(r)`, nunca de `r.URL.Path`.** O
+  `ServeMux` só preenche `r.Pattern` na **cópia** da request que entrega ao
+  handler, então um middleware montado por fora do mux jamais o enxerga —
+  `mux.Handler(r)` devolve `(handler, pattern)` sem executar nada. É por isso que
+  `metrics` recebe o `*http.ServeMux` concreto, e não o `http.Handler` já
+  embrulhado. Usar o path cru criaria uma série de métrica **por imóvel**.
+- **`routeLabel` corta o método do pattern.** O `ServeMux` 1.22+ devolve
+  `"GET /api/v1/properties/{id}"`; sem o corte o label viraria `"GET /metrics"` e
+  a exclusão do próprio endpoint deixaria de casar. Pattern vazio (404 em rota
+  inexistente, preflight respondido pelo `cors`, método errado) vira o valor fixo
+  `unmatched`.
+- **Os coletores são variáveis de pacote, registradas via `promauto` no
+  `DefaultRegisterer`.** Registrar dentro de `NewRouter` faria a **segunda**
+  chamada no mesmo processo entrar em panic por duplicate registration — e os
+  testes chamam `NewRouter` várias vezes. O `DefaultRegisterer` também é o que dá
+  as métricas do runtime Go de graça (`GoCollector`/`ProcessCollector`).
+- **Inc/Dec do gauge e a contabilização ficam em `defer`**, para que o in-flight
+  volte a zero e o counter registre o 500 mesmo quando o handler entra em panic.
+- **O próprio `/metrics` não é instrumentado**: o middleware desvia antes de
+  tocar em qualquer coletor. Uma rota cuja latência sobe com o número de séries
+  se realimentaria.
+- **Sem autenticação, por escopo declarado.** Proteger o endpoint é topologia de
+  rede (firewall, rede interna, proxy autenticado), documentada no `README.md`.
+  Não existe toggle por ambiente: `internal/api` não importa `internal/config`, e
+  o endpoint é sempre ativo como `/health`. Se um dia precisar de toggle, ele
+  entra por `Deps`.
+- **Custo aceito:** `mux.Handler(r)` resolve a rota uma vez a mais por
+  requisição (o mux resolve de novo ao servir). É uma busca em árvore,
+  desprezível frente ao I/O do handler, e é o preço do label correto.
+
 ## `GET /api/v1/properties/{id}` — detalhe (`properties_handler.go`)
 - **É a tela de comparação entre portais**: o imóvel canônico mais **todos** os
   anúncios vinculados, cada um com seu preço e a URL de origem.
@@ -193,9 +233,9 @@ orquestra o boot.
   de log nos testes injetando um handler próprio.
 
 ## Dependencies
-Stdlib + `pgxpool` + `go-redis`. **Não importa `internal/config`**: recebe tudo
-por `Deps`, como `internal/cache` recebe a `REDIS_URL` por parâmetro. Importado
-por `cmd/api`.
+Stdlib + `pgxpool` + `go-redis` + `prometheus/client_golang`. **Não importa
+`internal/config`**: recebe tudo por `Deps`, como `internal/cache` recebe a
+`REDIS_URL` por parâmetro. Importado por `cmd/api`.
 
 ## Gotchas
 - **`registerV1Routes` é o ponto de extensão.** Rotas novas entram lá, com o
@@ -240,3 +280,11 @@ por `cmd/api`.
 - **Mudou o shape do DTO de resposta? Troque o `v1` da chave de cache.** Sem
   isso, entradas gravadas com o formato antigo continuam sendo servidas por até
   5 minutos.
+- **Teste de métrica assere por delta, nunca por valor absoluto.** O registry é
+  global e compartilhado por todos os testes do pacote; valor absoluto passaria a
+  depender da ordem de execução. Pelo mesmo motivo, um `CounterVec` sem nenhum
+  filho **não emite linha alguma** no output — um teste que só faz scrape, sem
+  uma requisição real antes, não encontra as séries de rota.
+- **O `Content-Type` do `promhttp` não é estável.** Versões recentes acrescentam
+  `charset` e `escaping`; assere por substring (`text/plain`, `version=0.0.4`),
+  não por igualdade.
