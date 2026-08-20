@@ -25,7 +25,10 @@ type Deps struct {
 	Pool        *pgxpool.Pool
 	Redis       *redis.Client
 	CORSOrigins []string
-	Logger      *slog.Logger
+	// RateLimitRPM é o teto de requisições por minuto por IP. Zero (o
+	// zero-value) desliga o rate limiting, assim como um Redis nulo.
+	RateLimitRPM int
+	Logger       *slog.Logger
 }
 
 func (d Deps) logger() *slog.Logger {
@@ -38,15 +41,18 @@ func (d Deps) logger() *slog.Logger {
 // NewRouter monta o roteador com a cadeia de middlewares.
 //
 // A ordem é de fora para dentro: metrics → recovery → requestID → logging →
-// cors → jsonErrors → mux. metrics é o mais externo para observar o status
-// final, inclusive o 500 que o recovery escreve depois de um panic — por dentro
-// dele, a taxa de erro subestimaria falhas reais; recovery vem em seguida para
-// que um panic em qualquer outro middleware ainda vire 500; requestID vem dentro
-// dele (para que o panic continue virando 500) e fora do logging (para que toda
-// linha de log já tenha o id); logging registra o status que o recovery
-// escreveu; cors precisa responder o preflight sem passar pelo mux (que
-// devolveria 404 na rota inexistente do preflight); jsonErrors é o mais interno
-// porque só existe para reescrever o que o próprio mux emite.
+// cors → rateLimit → jsonErrors → mux. metrics é o mais externo para observar o
+// status final, inclusive o 500 que o recovery escreve depois de um panic e o
+// 429 que o rateLimit devolve — por dentro do recovery, a taxa de erro
+// subestimaria falhas reais; recovery vem em seguida para que um panic em
+// qualquer outro middleware ainda vire 500; requestID vem dentro dele (para que
+// o panic continue virando 500) e fora do logging (para que toda linha de log já
+// tenha o id); logging registra o status que o recovery escreveu; cors precisa
+// responder o preflight sem passar pelo mux (que devolveria 404 na rota
+// inexistente do preflight); rateLimit fica dentro do logging (para o 429 ser
+// logado) e dentro do cors (para o preflight OPTIONS não consumir cota);
+// jsonErrors é o mais interno porque só existe para reescrever o que o próprio
+// mux emite.
 func NewRouter(deps Deps) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
@@ -57,6 +63,7 @@ func NewRouter(deps Deps) http.Handler {
 
 	var handler http.Handler = mux
 	handler = jsonErrors(handler)
+	handler = rateLimit(handler, newRateLimitStore(deps.Redis), deps.RateLimitRPM, logger)
 	handler = cors(handler, deps.CORSOrigins)
 	handler = logging(handler, logger)
 	handler = requestID(handler)

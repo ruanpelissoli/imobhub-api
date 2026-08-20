@@ -52,7 +52,8 @@ Copie `.env.example` para `.env` e preencha os valores (na prática, só a
 
 Cada binário lê o subconjunto de que precisa: `cmd/scraper` usa `config.Load()`
 (exige `ANTHROPIC_API_KEY`) e `cmd/api` usa `config.LoadAPI()` (exige apenas
-`DATABASE_URL` e `REDIS_URL`, mais `PORT` e `CORS_ORIGINS` opcionais).
+`DATABASE_URL` e `REDIS_URL`, mais `PORT`, `CORS_ORIGINS` e `RATE_LIMIT_RPM`
+opcionais).
 
 ## Ambiente local com Docker
 
@@ -143,6 +144,31 @@ curl -s localhost:8080/metrics | grep http_requests_total
 > esquecimento. Em produção ele deve ficar atrás de firewall, em rede interna ou
 > por trás de um proxy autenticado: latência por rota e taxa de erro descrevem a
 > topologia da API para quem quiser atacá-la.
+
+### Rate limiting por IP
+
+Todo endpoint público aceita no máximo `RATE_LIMIT_RPM` requisições por minuto
+por IP (default `60`). O contador é uma janela fixa de 60s no Redis, então
+reiniciar a API **não** zera o limite. Acima do teto a resposta é `429` com
+`Retry-After`; `X-RateLimit-Limit` e `X-RateLimit-Remaining` acompanham todas as
+respostas contadas.
+
+```bash
+for i in $(seq 1 65); do curl -s -o /dev/null -w '%{http_code} ' localhost:8080/api/v1/properties; done
+curl -i localhost:8080/api/v1/properties   # 429 {"error":"too many requests"} depois do 60º
+```
+
+`RATE_LIMIT_RPM=0` **desliga** o limitador (só para testes locais); negativo ou
+não numérico é erro de boot. `/health` e `/metrics` são isentos — nem o liveness
+do orquestrador nem o scrape do Prometheus podem levar 429 por causa do tráfego
+de um vizinho no mesmo NAT.
+
+> **Sem proxy reverso na frente**, a chave é o IP de `RemoteAddr` e
+> `X-Forwarded-For` é **ignorado de propósito**: aceitá-lo deixaria qualquer
+> cliente escolher a própria cota trocando um header. No dia em que a API for
+> para trás de um proxy, todo o tráfego colapsa num único IP e o limite vira
+> global — aí nasce uma config `TRUSTED_PROXY`. Falha do Redis é **fail-open**:
+> a requisição passa com um log em `warn`, nunca 500.
 
 Uma execução aplica as migrations pendentes e roda duas etapas em sequência:
 

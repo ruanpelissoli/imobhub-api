@@ -1,11 +1,11 @@
 # internal/api
 
 ## Purpose
-Monta o servidor HTTP: roteador (`/api/v1` + `/health`), os middlewares base
-(recovery, request id, logging, CORS, envelope JSON de erro), o ciclo de vida do
-`http.Server` (timeouts + shutdown gracioso) e os handlers de negócio — hoje
-`GET /api/v1/properties` (busca paginada com cache Redis). `cmd/api` só
-orquestra o boot.
+Monta o servidor HTTP: roteador (`/api/v1` + `/health` + `/metrics`), os
+middlewares base (métricas, recovery, request id, logging, CORS, rate limiting
+por IP, envelope JSON de erro), o ciclo de vida do `http.Server` (timeouts +
+shutdown gracioso) e os handlers de negócio — hoje `GET /api/v1/properties`
+(busca paginada com cache Redis). `cmd/api` só orquestra o boot.
 
 ## Key decisions
 - **Roteador é o `net/http.ServeMux` da stdlib, não `chi`.** Desde o Go 1.22 o
@@ -16,11 +16,11 @@ orquestra o boot.
   por grupo, por exemplo), a troca é local a este pacote — mas aí `chi` passa a
   ser o roteador **de todo o projeto**, não de um handler só.
 - **Ordem da cadeia, de fora para dentro: `metrics → recovery → requestID →
-  logging → cors → jsonErrors → mux`.** Cada posição é deliberada:
+  logging → cors → rateLimit → jsonErrors → mux`.** Cada posição é deliberada:
   - `metrics` é o mais externo para observar o **status final**, inclusive o 500
-    que o `recovery` escreve depois de um panic. Por dentro do `recovery`, o
-    unwinding passaria por ele antes da contabilização e a taxa de erro
-    subestimaria as falhas reais;
+    que o `recovery` escreve depois de um panic e o 429 do `rateLimit`. Por
+    dentro do `recovery`, o unwinding passaria por ele antes da contabilização e
+    a taxa de erro subestimaria as falhas reais;
   - `recovery` vem em seguida para que um panic em qualquer outro middleware
     ainda vire 500 em vez de derrubar a conexão;
   - `requestID` fica **entre** os dois: dentro do `recovery` (para que um panic
@@ -30,6 +30,10 @@ orquestra o boot.
   - `logging` vem abaixo para registrar o status que o `recovery` escreveu;
   - `cors` precisa responder o preflight **antes** do mux — `OPTIONS /api/v1/x`
     numa rota inexistente viraria 404 se descesse;
+  - `rateLimit` fica **dentro** do `logging` (para o 429 aparecer no log como
+    qualquer outra resposta) e **dentro** do `cors` (o preflight `OPTIONS` é
+    respondido pelo CORS e não consome cota — cobrar do browser a pergunta que
+    ele é obrigado a fazer dobraria o custo de cada requisição do front);
   - `jsonErrors` é o mais interno porque só existe para reescrever o que o
     próprio mux emite.
 - **`request_id` é herdado-e-validado ou gerado.** O `X-Request-Id` da
@@ -85,6 +89,63 @@ orquestra o boot.
 - **`Shutdown` usa `context.Background()`**, não o contexto já cancelado pelo
   sinal — passá-lo abortaria o shutdown na hora, o oposto de deixar as
   requisições em voo terminarem.
+
+## Rate limiting por IP (`ratelimit_middleware.go`)
+- **É o limitador *inbound*, sem nenhuma relação com `internal/ratelimit`**, que
+  é *outbound* (espaçamento entre requisições de scraping/geocoding, in-memory e
+  bloqueante). Não reuse um no lugar do outro.
+- **Janela fixa de 60s, não deslizante.** A chave `ratelimit:<ip>:<janela>` já
+  *é* um contador por janela; um sliding window exigiria sorted set com limpeza
+  por requisição — custo desproporcional para uma defesa anti-abuso. O preço
+  aceito é o **burst de fronteira**: até `2×limit` nos dois segundos ao redor da
+  virada. Se isso virar problema, o upgrade é sliding window log, não ajuste do
+  limite.
+- **`INCR` sempre, `EXPIRE` só quando o contador volta `1`** — 1 round-trip por
+  requisição, 2 apenas na primeira da janela. Um `TxPipeline` (1 round-trip
+  sempre) exigiria expor `TxPipeline() redis.Pipeliner` no seam, e
+  `redis.Pipeliner` é grande demais para fakear no padrão do pacote — os testes
+  daqui rodam sem Redis. O risco de chave órfã sem TTL só existe se o `EXPIRE`
+  falhar, que já é o cenário de Redis degradado (logado em `Warn`), e a chave é
+  por janela: o vazamento não contamina a contagem seguinte.
+- **TTL = janela + 10s de folga.** Sem folga, o desencontro entre o relógio do
+  processo e o do Redis pode expirar a chave antes do fim da janela e zerar a
+  contagem no meio do minuto.
+- **Fail-open.** Qualquer erro ou timeout do Redis vira `logger.Warn` e a
+  requisição passa, nunca 500. O limitador contém abuso; não pode ser o ponto
+  único de falha que derruba a API quando o cache pisca. Nesse caminho
+  `X-RateLimit-Remaining` sai igual ao limite — é a verdade operacional ("nada
+  está sendo contado agora"), e o critério de aceite exige os headers em **toda**
+  resposta.
+- **`rateLimitOpTimeout` de 200ms, derivado de `r.Context()`** — mesma razão de
+  `propertyCacheOpTimeout`.
+- **A chave é o IP de `r.RemoteAddr` (só o host, via `net.SplitHostPort`).**
+  `X-Forwarded-For` é **ignorado**: sem proxy confiável na frente, aceitá-lo
+  deixaria qualquer cliente escolher a própria chave e burlar o limite com um
+  header. `RemoteAddr` sem porta ou malformado usa a string crua — chave estranha
+  ainda limita, panic derruba a requisição. **No dia em que entrar um reverse
+  proxy, todo o tráfego colapsa num único IP e o limite vira global**: aí nasce
+  uma config `TRUSTED_PROXY`.
+- **`rateLimitExemptPaths` (`/health`, `/metrics`) não toca o Redis nem emite os
+  headers.** O liveness do orquestrador e o scrape do Prometheus não podem
+  receber 429 por causa do tráfego de um vizinho no mesmo NAT — um alerta que
+  cega justamente quando a API está sob abuso é o pior momento possível para
+  perder observabilidade. Mesmo conjunto de `quietPaths`, casamento por path
+  **exato**.
+- **`Retry-After` tem mínimo 1 e arredonda para cima.** Um `Retry-After: 0`
+  convida o cliente a repetir imediatamente, que é exatamente o que se quer
+  conter. `X-RateLimit-Remaining` nunca é negativo: satura em `0`.
+- **Store nil ou limite `<= 0` devolvem o handler intacto**, sem alocar um
+  middleware por requisição — mesma técnica do `cors` com allowlist vazia. É por
+  isso que `NewRouter(Deps{Logger: ...})` (sem Redis, `RateLimitRPM` no
+  zero-value) continua funcionando nos testes do pacote. `newRateLimitStore(nil)`
+  devolve `nil` **antes** da atribuição à interface, pela mesma armadilha de
+  `newPropertyCache`.
+- **A requisição bloqueada não chega ao mux**, então não toca Postgres nem o
+  cache de properties. O corpo é o envelope do projeto, via `writeError`.
+- **O limite vem de `Deps.RateLimitRPM`** (`RATE_LIMIT_RPM`, default 60,
+  preenchido em `cmd/api`), porque este pacote não importa `internal/config`. Já
+  a janela, a folga do TTL e o timeout são constantes do pacote — mesma regra de
+  `propertySearchCacheTTL`.
 
 ## `GET /api/v1/properties` — busca (`properties_search_handler.go`, `properties_cache.go`)
 - **A busca reusa `propertyResponse`, o DTO do imóvel**, embutindo-o em
@@ -142,7 +203,9 @@ orquestra o boot.
   `Access-Control-Expose-Headers: X-Cache, X-Request-Id` para origens permitidas
   — sem isso o browser esconde os dois headers: o front não consegue nem medir o
   hit rate, nem citar o `request_id` num relato de erro, que é a razão de
-  devolvê-lo. Header novo que o front precise ler entra em `corsExposeHeaders`.
+  devolvê-lo. A lista cresceu com `Retry-After`, `X-RateLimit-Limit` e
+  `X-RateLimit-Remaining` pelo mesmo motivo. Header novo que o front precise ler
+  entra em `corsExposeHeaders`.
 - **Seams declarados no consumidor** (`propertySearcher`, `cacheStore`), mesmo
   padrão de `grouping.PropertyStore`: o wiring de produção fecha sobre
   `deps.Pool`/`deps.Redis` em `registerV1Routes` e os testes injetam closures e um

@@ -41,6 +41,12 @@ em `internal/api`.
   Timeout estourado é log de erro e exit 1.
 - As dependências chegam aos handlers por `api.Deps`, passada por parâmetro.
   Nada de variável global: é o que permite testar handlers com um pool próprio.
+- **Toda config do servidor é copiada de `cfg` para `api.Deps` aqui** —
+  `CORSOrigins` e `RateLimitRPM` (de `RATE_LIMIT_RPM`) inclusive. `internal/api`
+  não importa `internal/config`, então uma variável nova do servidor HTTP exige
+  **três** edições: `config.APIConfig`, o campo em `api.Deps` e esta montagem.
+  Esquecer a última deixa o campo no zero-value — para `RateLimitRPM`, isso
+  significa rate limiting **desligado** em produção, em silêncio.
 
 ## Dependencies
 `internal/config` (`LoadAPI`), `internal/db` (`Connect`), `internal/cache`
