@@ -10,15 +10,20 @@ const (
 	// DefaultPort é a porta usada quando PORT não está definida.
 	DefaultPort = 8080
 
+	// DefaultRateLimitRPM é o teto de requisições por minuto por IP na API HTTP.
+	// 60 é folgado para navegação humana e ainda contém raspagem automatizada.
+	DefaultRateLimitRPM = 60
+
 	// minPort/maxPort delimitam a faixa válida de portas TCP. Fora dela o bind
 	// falharia mais tarde, com uma mensagem do sistema operacional que não cita
 	// a variável de ambiente responsável.
 	minPort = 1
 	maxPort = 65535
 
-	envPort        = "PORT"
-	envCORSOrigins = "CORS_ORIGINS"
-	corsOriginsSep = ","
+	envPort         = "PORT"
+	envCORSOrigins  = "CORS_ORIGINS"
+	envRateLimitRPM = "RATE_LIMIT_RPM"
+	corsOriginsSep  = ","
 )
 
 // APIConfig agrupa a configuração de runtime do servidor HTTP (cmd/api).
@@ -32,6 +37,9 @@ type APIConfig struct {
 	// CORSOrigins é a allowlist de origens do navegador. Vazia (nil) desliga o
 	// CORS por completo.
 	CORSOrigins []string
+	// RateLimitRPM é o teto de requisições por minuto por IP. Zero desliga o
+	// rate limiting.
+	RateLimitRPM int
 }
 
 // LoadAPI lê a configuração do servidor HTTP das variáveis de ambiente.
@@ -62,11 +70,17 @@ func LoadAPI() (*APIConfig, error) {
 		return nil, err
 	}
 
+	rateLimitRPM, err := parseNonNegativeInt(envRateLimitRPM, DefaultRateLimitRPM)
+	if err != nil {
+		return nil, err
+	}
+
 	return &APIConfig{
-		DatabaseURL: databaseURL,
-		RedisURL:    redisURL,
-		Port:        port,
-		CORSOrigins: parseCORSOrigins(lookup(envCORSOrigins, "")),
+		DatabaseURL:  databaseURL,
+		RedisURL:     redisURL,
+		Port:         port,
+		CORSOrigins:  parseCORSOrigins(lookup(envCORSOrigins, "")),
+		RateLimitRPM: rateLimitRPM,
 	}, nil
 }
 

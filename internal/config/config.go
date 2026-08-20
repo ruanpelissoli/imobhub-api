@@ -267,6 +267,27 @@ func parsePositiveInt(envName string, fallback int) (int, error) {
 	return parsed, nil
 }
 
+// parseNonNegativeInt lê um inteiro em que zero é a forma documentada de
+// desativar o recurso e negativo é erro. Existe em vez de reusar
+// parseRateLimitMS porque a mensagem daquele cita "milliseconds", que seria
+// enganosa para um limite contado em requisições.
+func parseNonNegativeInt(envName string, fallback int) (int, error) {
+	raw := lookup(envName, "")
+	if raw == "" {
+		return fallback, nil
+	}
+
+	parsed, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be a non-negative integer, got %q: %w", envName, raw, err)
+	}
+	if parsed < 0 {
+		return 0, fmt.Errorf("config: %s must be zero or positive, got %d", envName, parsed)
+	}
+
+	return parsed, nil
+}
+
 // parseRateLimitMS lê um intervalo em milissegundos com as regras comuns a
 // todos os rate limits do projeto: inteiro, zero desativa o espaçamento
 // (só para testes locais) e negativo é erro. Existe para que

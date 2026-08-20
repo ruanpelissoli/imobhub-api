@@ -53,10 +53,11 @@ func run(logger *slog.Logger) error {
 	// A API não aplica migrations: quem é dono do schema é o scraper. Uma API de
 	// leitura que migra no boot mudaria o schema a cada deploy dela.
 	router := api.NewRouter(api.Deps{
-		Pool:        pool,
-		Redis:       redisClient,
-		CORSOrigins: cfg.CORSOrigins,
-		Logger:      logger,
+		Pool:         pool,
+		Redis:        redisClient,
+		CORSOrigins:  cfg.CORSOrigins,
+		RateLimitRPM: cfg.RateLimitRPM,
+		Logger:       logger,
 	})
 
 	ln, err := api.Listen(fmt.Sprintf(":%d", cfg.Port))
@@ -68,6 +69,7 @@ func run(logger *slog.Logger) error {
 		"addr", ln.Addr().String(),
 		"port", cfg.Port,
 		"cors_origins", cfg.CORSOrigins,
+		"rate_limit_rpm", cfg.RateLimitRPM,
 	)
 
 	// Bloqueia até SIGINT/SIGTERM; os defers acima fecham pool e Redis só depois

@@ -14,10 +14,11 @@ const (
 	// detalhe (erro do pgx, stack trace, connection string) fica só no log:
 	// DATABASE_URL e REDIS_URL carregam senha, e um stack trace no corpo entrega
 	// a estrutura interna a quem chamar a API.
-	msgInternalError = "internal server error"
-	msgNotFound      = "not found"
-	msgNotAllowed    = "method not allowed"
-	msgInvalidID     = "id inválido"
+	msgInternalError   = "internal server error"
+	msgNotFound        = "not found"
+	msgNotAllowed      = "method not allowed"
+	msgInvalidID       = "id inválido"
+	msgTooManyRequests = "too many requests"
 )
 
 // errorBody é o envelope de erro do projeto. Todo handler da API responde

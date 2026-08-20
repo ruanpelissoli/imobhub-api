@@ -126,7 +126,10 @@ comodidades do `TermExtractor` chega por parâmetro de construtor (de
   liveness e `/metrics` (Prometheus) fora do grupo, middlewares de
   metrics/recovery/logging/CORS e a conversão dos 404/405 do `ServeMux` para o
   envelope `{"error":"..."}`. Esse envelope é
-  convenção do projeto para toda resposta de erro. Duas rotas de negócio:
+  convenção do projeto para toda resposta de erro. Tem também o **rate limiting
+  inbound por IP** (`ratelimit_middleware.go`, janela fixa de 60s no Redis,
+  fail-open), que é **independente** de `internal/ratelimit` — aquele é o
+  limitador *outbound* de scraping/geocoding, in-memory e bloqueante. Duas rotas de negócio:
   `GET /api/v1/properties/{id}` (`properties_handler.go`) devolve o imóvel
   canônico + anúncios vinculados, **sem Redis** e em duas queries fixas
   (`db.GetPropertyWithListings`); `GET /api/v1/properties`
