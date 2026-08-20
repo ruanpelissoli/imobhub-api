@@ -262,18 +262,21 @@ func TestInfrastructureRoutesAreNotRateLimitedThroughTheRouter(t *testing.T) {
 	}
 }
 
-// O conjunto de isenções precisa acompanhar as rotas de infraestrutura reais:
-// uma rota nova registrada fora do /api/v1 e esquecida aqui passa a competir
-// pela mesma cota do tráfego de produto.
-func TestRateLimitExemptPathsCoverTheInfrastructureRoutes(t *testing.T) {
+// quietPaths e rateLimitExemptPaths descrevem o mesmo conjunto: as rotas de
+// infraestrutura. Um path de infra acrescentado só ao primeiro passaria a
+// receber 429 pelo tráfego de um vizinho no mesmo NAT — e, sendo quiet, sem uma
+// linha de log em Info que denunciasse.
+func TestRateLimitExemptsEveryInfrastructurePath(t *testing.T) {
 	for _, path := range []string{"/health", metricsPath} {
 		if _, exempt := rateLimitExemptPaths[path]; !exempt {
 			t.Errorf("%q não está em rateLimitExemptPaths", path)
 		}
 	}
-	if len(rateLimitExemptPaths) != len(quietPaths) {
-		t.Errorf("rateLimitExemptPaths tem %d paths e quietPaths %d — os dois conjuntos descrevem as mesmas rotas de infraestrutura",
-			len(rateLimitExemptPaths), len(quietPaths))
+
+	for path := range quietPaths {
+		if _, exempt := rateLimitExemptPaths[path]; !exempt {
+			t.Errorf("%q é quiet no log mas não é isento do rate limiting", path)
+		}
 	}
 }
 
