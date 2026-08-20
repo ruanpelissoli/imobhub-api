@@ -38,8 +38,7 @@ const (
 )
 
 // quietPaths são os paths de infraestrutura, logados em Debug para não afogar o
-// log de produção com o liveness do orquestrador. /metrics já entra aqui mesmo
-// sem existir no roteador ainda, para não exigir edição quando nascer.
+// log de produção com o liveness do orquestrador e o scrape do Prometheus.
 var quietPaths = map[string]struct{}{
 	"/health":  {},
 	"/metrics": {},

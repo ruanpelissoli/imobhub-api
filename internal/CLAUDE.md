@@ -27,7 +27,7 @@ Grafo de importação atual (mantê-lo acíclico e raso):
 ```
 cmd/scraper → config, db, cache, scraper, enrichqueue
 cmd/api     → config, db, cache, api
-api         → pgxpool, go-redis, stdlib   (NÃO importa config)
+api         → pgxpool, go-redis, prometheus/client_golang, stdlib   (NÃO importa config)
 cache       → go-redis    (folha, como config e db)
 scraper     → config, db, ratelimit, robots, selectors, sources, pgxpool
 enrichqueue → ai, config, db, enrichment, grouping, pgxpool
@@ -56,7 +56,11 @@ allowlist de CORS e logger por `api.Deps`, montada em `cmd/api`. É a mesma regr
 de `cache`, que recebe a `REDIS_URL` por parâmetro — quem lê o ambiente é só
 `config`, e quem o repassa é só o `main`. O roteador é o `net/http.ServeMux` da
 stdlib (nenhum `chi`/`gorilla` no `go.mod`); o porquê está em
-`internal/api/CLAUDE.md`.
+`internal/api/CLAUDE.md`. `prometheus/client_golang` é a **única** dependência
+externa do pacote e uma exceção consciente à mesma regra que barra o `chi`: a
+stdlib não emite o formato de exposição do Prometheus nem mantém histogramas.
+Serve `GET /metrics` (fora do `/api/v1`, como `/health`) a partir de um
+middleware que é a camada mais externa da cadeia.
 
 `config` e `cache` são folhas do grafo — não importam nada do projeto. `cache`
 recebe a `REDIS_URL` por parâmetro (de `cfg.RedisURL`, em `main`) justamente
@@ -119,8 +123,9 @@ comodidades do `TermExtractor` chega por parâmetro de construtor (de
   extrator, normalizador e agrupador é compartilhada por todos os workers — o
   geocoder carrega o `DomainLimiter` de 1 req/s do Nominatim.
 - `api/` é o servidor HTTP: roteador com o grupo `/api/v1`, `/health` de
-  liveness fora do grupo, middlewares de recovery/logging/CORS e a conversão dos
-  404/405 do `ServeMux` para o envelope `{"error":"..."}`. Esse envelope é
+  liveness e `/metrics` (Prometheus) fora do grupo, middlewares de
+  metrics/recovery/logging/CORS e a conversão dos 404/405 do `ServeMux` para o
+  envelope `{"error":"..."}`. Esse envelope é
   convenção do projeto para toda resposta de erro. Tem também o **rate limiting
   inbound por IP** (`ratelimit_middleware.go`, janela fixa de 60s no Redis,
   fail-open), que é **independente** de `internal/ratelimit` — aquele é o

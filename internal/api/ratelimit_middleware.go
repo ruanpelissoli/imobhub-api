@@ -35,9 +35,9 @@ const (
 )
 
 // rateLimitExemptPaths são os paths de infraestrutura que nunca são limitados —
-// o liveness do orquestrador não pode receber 429 por causa do tráfego de um
-// vizinho no mesmo NAT. /metrics já entra aqui mesmo sem existir no roteador,
-// pela mesma razão de quietPaths. O casamento é por path exato.
+// o liveness do orquestrador e o scrape do Prometheus não podem receber 429 por
+// causa do tráfego de um vizinho no mesmo NAT. O casamento é por path exato,
+// como em quietPaths.
 var rateLimitExemptPaths = map[string]struct{}{
 	"/health":  {},
 	"/metrics": {},

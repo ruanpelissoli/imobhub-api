@@ -245,16 +245,35 @@ func TestRateLimitExemptsInfrastructurePaths(t *testing.T) {
 	}
 }
 
-func TestHealthIsNotRateLimitedThroughTheRouter(t *testing.T) {
+func TestInfrastructureRoutesAreNotRateLimitedThroughTheRouter(t *testing.T) {
 	router := NewRouter(Deps{Logger: discardLogger(), RateLimitRPM: 1})
 
-	for i := 0; i < 5; i++ {
-		rec := httptest.NewRecorder()
-		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	for _, path := range []string{"/health", metricsPath} {
+		t.Run(path, func(t *testing.T) {
+			for i := 0; i < 5; i++ {
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 
-		if rec.Code != http.StatusOK {
-			t.Fatalf("requisição %d: status = %d, want %d", i+1, rec.Code, http.StatusOK)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("requisição %d: status = %d, want %d", i+1, rec.Code, http.StatusOK)
+				}
+			}
+		})
+	}
+}
+
+// O conjunto de isenções precisa acompanhar as rotas de infraestrutura reais:
+// uma rota nova registrada fora do /api/v1 e esquecida aqui passa a competir
+// pela mesma cota do tráfego de produto.
+func TestRateLimitExemptPathsCoverTheInfrastructureRoutes(t *testing.T) {
+	for _, path := range []string{"/health", metricsPath} {
+		if _, exempt := rateLimitExemptPaths[path]; !exempt {
+			t.Errorf("%q não está em rateLimitExemptPaths", path)
 		}
+	}
+	if len(rateLimitExemptPaths) != len(quietPaths) {
+		t.Errorf("rateLimitExemptPaths tem %d paths e quietPaths %d — os dois conjuntos descrevem as mesmas rotas de infraestrutura",
+			len(rateLimitExemptPaths), len(quietPaths))
 	}
 }
 
